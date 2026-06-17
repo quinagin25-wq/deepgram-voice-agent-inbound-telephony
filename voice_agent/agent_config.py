@@ -190,6 +190,24 @@ Say goodbye FIRST, then call this function. Do not generate text after calling i
             "required": ["reason"]
         }
     ),
+  ThinkSettingsV1FunctionsItem(
+        name="transfer_call",
+        description="""Transfer the call to a live sales representative.
+
+Call this when the contractor explicitly agrees to speak with someone on the team.
+Say "Perfect, let me connect you with someone on our team right now." FIRST, then call this function.""",
+        parameters={
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Why the call is being transferred",
+                    "enum": ["interested_in_service", "requested_rep"]
+                }
+            },
+            "required": ["reason"]
+        }
+    ),
 ]
 
 
