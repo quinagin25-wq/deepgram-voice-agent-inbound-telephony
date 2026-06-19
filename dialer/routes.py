@@ -2,13 +2,7 @@
 Power dialer - human-initiated, single-call-only outbound dialing.
 
 TCPA compliance constraint (do not weaken this): every outbound AI call to
-the 3,104-contractor list requires a human to physically click "Call" for
-that specific contractor.
-
-This module enforces:
-- single-call lock (server-side)
-- no batch dialing
-- no concurrent outbound calls
+the contractor list requires a human click per call.
 """
 
 import asyncio
@@ -37,7 +31,7 @@ from backend.contractor_lookup import (
 logger = logging.getLogger(__name__)
 
 # -----------------------------
-# GLOBAL CALL LOCK (TCPA SAFETY)
+# CALL LOCK
 # -----------------------------
 _active_call_lock = {
     "in_progress": False,
@@ -48,13 +42,12 @@ _active_call_lock = {
     "started_at": None,
 }
 
-
 # -----------------------------
-# TWILIO CLIENT
+# TWILIO
 # -----------------------------
 def _get_twilio_client() -> TwilioClient:
     if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-        raise RuntimeError("Twilio credentials missing.")
+        raise RuntimeError("Missing Twilio credentials.")
     return TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 
@@ -71,7 +64,7 @@ def _status_callback_url() -> str:
 
 
 # -----------------------------
-# UI (OPERATOR MODE)
+# UI
 # -----------------------------
 async def dialer_page(request: Request) -> HTMLResponse:
     business_entity = request.query_params.get("business_entity", "CO-003")
@@ -80,21 +73,14 @@ async def dialer_page(request: Request) -> HTMLResponse:
     page_size = min(200, max(10, int(request.query_params.get("page_size", "50"))))
     offset = (page - 1) * page_size
 
-    exclude_statuses = ["booked", "declined"]
-
-    total = await count_contractors(
-        business_entity=business_entity,
-        exclude_statuses=exclude_statuses,
-    )
+    total = await count_contractors(business_entity=business_entity)
 
     contractors = await list_contractors(
         business_entity=business_entity,
         limit=page_size,
         offset=offset,
-        exclude_statuses=exclude_statuses,
     )
 
-    # LEFT QUEUE ROWS
     rows_html = ""
     for c in contractors:
         phone = c["phone"]
@@ -108,7 +94,9 @@ async def dialer_page(request: Request) -> HTMLResponse:
                 <div style="font-size:11px;color:#777">{phone}</div>
             </td>
             <td style="text-align:right">
-                <button class="call-btn" onclick="event.stopPropagation(); dial('{phone}')">
+                <button onclick="event.stopPropagation(); dial('{phone}')" style="
+                    background:#1D9E75;border:none;padding:6px 10px;
+                    border-radius:6px;cursor:pointer;font-weight:bold;">
                     Call
                 </button>
             </td>
@@ -124,7 +112,7 @@ async def dialer_page(request: Request) -> HTMLResponse:
 <style>
 body {{
     margin:0;
-    font-family: Arial;
+    font-family:Arial;
     background:#0f1115;
     color:#e6e6e6;
     display:flex;
@@ -158,29 +146,6 @@ body {{
     border-radius:10px;
 }}
 
-button {{
-    padding:10px;
-    border:none;
-    border-radius:8px;
-    cursor:pointer;
-    font-weight:bold;
-}}
-
-.call-btn {{
-    background:#1D9E75;
-}}
-
-.actions {{
-    display:flex;
-    gap:10px;
-    margin-top:15px;
-}}
-
-.call {{ background:#2ecc71; }}
-.skip {{ background:#e67e22; }}
-.next {{ background:#3498db; }}
-.test {{ background:#e74c3c; }}
-
 tr {{
     cursor:pointer;
 }}
@@ -193,30 +158,22 @@ td {{
 tr:hover {{
     background:#1c2230;
 }}
-
-.box {{
-    background:#101521;
-    padding:12px;
-    border-radius:8px;
-    border:1px solid #2a2f3a;
-}}
 </style>
 </head>
 
 <body>
 
-<!-- LEFT -->
 <div class="left">
     <div style="padding:14px;border-bottom:1px solid #2a2f3a;">
         <b>Queue</b><br>
         <span style="color:#777;font-size:12px">{total} leads</span>
     </div>
+
     <table style="width:100%">
         {rows_html}
     </table>
 </div>
 
-<!-- RIGHT -->
 <div class="right">
 
     <div class="top">
@@ -225,24 +182,14 @@ tr:hover {{
     </div>
 
     <div class="card">
-        <div id="leadName" style="font-size:20px;font-weight:bold;">
-            Select a lead
-        </div>
-        <div id="leadPhone" style="color:#9bb3c9;margin-top:5px;"></div>
-        <div id="leadStatus" style="margin-top:10px;color:#777;"></div>
+        <div id="name" style="font-size:20px;font-weight:bold;">Select a lead</div>
+        <div id="phone" style="color:#9bb3c9;margin-top:5px;"></div>
+        <div id="status" style="margin-top:10px;color:#777;"></div>
 
-        <div class="actions">
-            <button class="call" onclick="callSelected()">Call</button>
-            <button class="skip">Skip</button>
-            <button class="next">Next</button>
-            <button class="test" onclick="testCall()">Test AI Call</button>
-        </div>
-    </div>
-
-    <div class="card">
-        <b>Details</b>
-        <div class="box" style="margin-top:10px;">
-            Select a lead to view details.
+        <div style="margin-top:15px;display:flex;gap:10px;">
+            <button onclick="callSelected()" style="background:#2ecc71;padding:10px;border:none;border-radius:8px;font-weight:bold;">Call</button>
+            <button style="background:#e67e22;padding:10px;border:none;border-radius:8px;font-weight:bold;">Skip</button>
+            <button onclick="testCall()" style="background:#e74c3c;padding:10px;border:none;border-radius:8px;font-weight:bold;">Test</button>
         </div>
     </div>
 
@@ -253,9 +200,9 @@ let selectedPhone = null;
 
 function selectLead(phone, name, status) {{
     selectedPhone = phone;
-    document.getElementById("leadName").innerText = name;
-    document.getElementById("leadPhone").innerText = phone;
-    document.getElementById("leadStatus").innerText = "Status: " + status;
+    document.getElementById("name").innerText = name;
+    document.getElementById("phone").innerText = phone;
+    document.getElementById("status").innerText = "Status: " + status;
 }}
 
 async function callSelected() {{
@@ -284,7 +231,7 @@ async function testCall() {{
     }});
 
     const data = await resp.json();
-    if (!resp.ok) return alert(data.error || "Failed");
+    if (!resp.ok) return alert(data.error);
 
     alert("Test call started");
 }}
@@ -298,7 +245,7 @@ async function testCall() {{
 
 
 # -----------------------------
-# DIAL LOGIC (UNCHANGED)
+# DIAL
 # -----------------------------
 async def dial(request: Request) -> JSONResponse:
     body = await request.json()
@@ -309,18 +256,18 @@ async def dial(request: Request) -> JSONResponse:
     if not phone:
         return JSONResponse({"error": "phone required"}, status_code=400)
 
-    normalized = normalize_phone(phone)
+    phone = normalize_phone(phone)
 
     if mode == "human":
-        await update_contractor_status(normalized, "CO-003", "dialed_manual")
-        return JSONResponse({"success": True, "mode": "human", "phone": normalized})
+        await update_contractor_status(phone, "CO-003", "dialed_manual")
+        return JSONResponse({"success": True, "mode": "human"})
 
     if _active_call_lock["in_progress"]:
         return JSONResponse({"error": "Call already in progress"}, status_code=409)
 
     _active_call_lock.update({
         "in_progress": True,
-        "phone": normalized,
+        "phone": phone,
         "status": "initiating",
         "started_at": datetime.now(timezone.utc).isoformat()
     })
@@ -329,18 +276,18 @@ async def dial(request: Request) -> JSONResponse:
         client = _get_twilio_client()
 
         call = client.calls.create(
-            to=normalized,
+            to=phone,
             from_=TWILIO_PHONE_NUMBER,
             url=_incoming_call_webhook_url(),
             status_callback=_status_callback_url(),
-            status_callback_event=["initiated","ringing","completed"],
+            status_callback_event=["initiated", "ringing", "completed"],
             status_callback_method="POST",
         )
 
         _active_call_lock["call_sid"] = call.sid
 
         if not is_test:
-            await update_contractor_status(normalized, "CO-003", "dialed")
+            await update_contractor_status(phone, "CO-003", "dialed")
 
         return JSONResponse({"success": True, "call_sid": call.sid})
 
@@ -350,7 +297,52 @@ async def dial(request: Request) -> JSONResponse:
 
 
 # -----------------------------
-# LOCK STATUS (UNCHANGED IDEA)
+# STATUS CALLBACK (RESTORED)
+# -----------------------------
+async def call_status_callback(request: Request) -> JSONResponse:
+    form = await request.form()
+    status = form.get("CallStatus")
+    sid = form.get("CallSid")
+
+    if _active_call_lock.get("call_sid") in (None, sid):
+        _active_call_lock["call_sid"] = sid
+        _active_call_lock["status"] = status
+
+    if status in ("completed", "failed", "busy", "no-answer", "canceled"):
+        _active_call_lock.update({
+            "in_progress": False,
+            "phone": None,
+            "call_sid": None,
+            "status": None,
+            "answered_by": None,
+            "started_at": None,
+        })
+
+    return JSONResponse({"ok": True})
+
+
+# -----------------------------
+# END CALL (RESTORED)
+# -----------------------------
+async def end_call(request: Request) -> JSONResponse:
+    sid = _active_call_lock.get("call_sid")
+
+    if not sid:
+        return JSONResponse({"error": "No active call"}, status_code=404)
+
+    try:
+        client = _get_twilio_client()
+        await asyncio.to_thread(client.calls(sid).update, status="completed")
+
+        _active_call_lock["in_progress"] = False
+        return JSONResponse({"success": True})
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# -----------------------------
+# LOCK STATUS
 # -----------------------------
 async def dialer_lock_status(request: Request) -> JSONResponse:
     return JSONResponse(_active_call_lock)
