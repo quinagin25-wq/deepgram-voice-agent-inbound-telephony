@@ -60,7 +60,7 @@ If YES website: Got it, we also help contractors who have a site but aren't gett
 
 Either way, once they show interest, find out if they can talk right now versus needing to book something for later: ask something like "Do you have about 30 minutes free right now to walk through it, or would it be easier to grab a time later today or this week?"
 
-If they can talk NOW: say "Perfect, let me connect you with someone on our team right now" and call transfer_call. Do not call check_availability or book_meeting in this path — the live transfer is the goal.
+If they can talk NOW: you MUST call the transfer_call function immediately - this is not optional, do not just say words about transferring without actually calling the function. Say "Perfect, let me connect you with someone on our team right now" AND call transfer_call in the same turn. Do not call check_availability or book_meeting in this path.
 If they CANNOT talk now, or prefer to schedule: use check_availability and offer the soonest realistic times, then use book_meeting once they agree to one. Default to finding the soonest available slot rather than pushing far out, unless the contractor specifically asks for a different day or time.
 If not interested in either right now: thank them and end the call gracefully.
 
@@ -88,15 +88,20 @@ def _build_system_prompt(contractor: dict = None) -> str:
 
 
 def _build_greeting(contractor: dict = None) -> str:
-    """Personalized greeting when we know who we're calling, generic fallback otherwise."""
+    """Personalized greeting when we know who we're calling, generic fallback otherwise.
+
+    Kept deliberately short and split into short clauses - a single long
+    sentence packed with multiple ideas (identity + AI disclosure + a
+    question) was causing the TTS to rush/overlap itself on test calls.
+    """
     if contractor and contractor.get("owner_name"):
-        owner_name = contractor["owner_name"].split(" ")[0]  # first name only, sounds natural
+        owner_name = contractor["owner_name"].split(" ")[0]
         business_name = contractor.get("business_name")
         if business_name:
-            return f"Hi, can I speak with {owner_name}? This is Maya, an AI assistant calling from craftd about {business_name}."
-        return f"Hi, is this {owner_name}? This is Maya, an AI assistant calling from craftd."
+            return f"Hi, is this {owner_name}? This is Maya, an AI assistant with craftd."
+        return f"Hi, is this {owner_name}? This is Maya, an AI assistant with craftd."
 
-    return "Hi, this is Maya calling from craftd — I'm an AI assistant. Is this a good time for a quick second?"
+    return "Hi there. This is Maya, an AI assistant with craftd. Is now an okay time?"
 
 # ---------------------------------------------------------------------------
 # Function definitions
@@ -178,7 +183,7 @@ Say goodbye FIRST, then call this function. Do not generate text after calling i
         name="transfer_call",
         description="""Transfer the call to a live sales representative.
 
-Call this when the contractor confirms they can talk right now for about 30 minutes, or explicitly asks to speak with a real person immediately.
+REQUIRED: call this function the moment the contractor confirms they can talk right now. Do not just say you're transferring without calling this - the transfer only actually happens when this function fires.
 Say "Perfect, let me connect you with someone on our team right now." FIRST, then call this function.
 
 Note: once this is called, you will not learn whether the rep actually answered - the call hands off completely. Only use this when the contractor has agreed to talk now.""",
