@@ -4,3 +4,5 @@ deepgram-sdk==6.0.0
 twilio==9.10.2
 python-dotenv==1.2.1
 python-multipart==0.0.22
+supabase==2.31.0
+requests==2.33.1
