@@ -26,6 +26,7 @@ AI mode vs human mode:
     manually from TextNow or Google Voice. No VOIP API integration exists
     (or is needed) for this - it's a status-tracking convenience only.
 """
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -45,8 +46,17 @@ from backend.contractor_lookup import list_contractors, count_contractors, norma
 logger = logging.getLogger(__name__)
 
 # Server-side lock - the actual TCPA-safety mechanism. True while any
-# outbound call placed through this dialer is in progress.
-_active_call_lock = {"in_progress": False, "phone": None, "started_at": None}
+# outbound call placed through this dialer is in progress. Also doubles as
+# the live call-state store the dialer page polls to show real status
+# (ringing/in-progress/voicemail/ended) instead of a static "Calling..." label.
+_active_call_lock = {
+    "in_progress": False,
+    "phone": None,
+    "call_sid": None,
+    "status": None,  # Twilio's CallStatus: queued/ringing/in-progress/completed/busy/no-answer/failed/canceled
+    "answered_by": None,  # AMD result: human/machine_start/machine_end_beep/etc, when available
+    "started_at": None,
+}
 
 
 def _get_twilio_client() -> TwilioClient:
@@ -132,12 +142,17 @@ async def dialer_page(request: Request) -> HTMLResponse:
   .call-btn {{ background: #1D9E75; color: #111; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: 600; }}
   .call-btn:disabled {{ background: #555; color: #999; cursor: not-allowed; }}
   .status {{ text-transform: capitalize; }}
-  #lock-banner {{ display: none; background: #5a3b00; color: #ffd27a; padding: 10px; border-radius: 6px; margin-bottom: 16px; }}
+  #lock-banner {{ display: none; background: #5a3b00; color: #ffd27a; padding: 10px 16px; border-radius: 6px; margin-bottom: 16px; align-items: center; justify-content: space-between; }}
+  #lock-banner.active {{ display: flex; }}
+  #end-call-btn {{ background: #c0392b; color: #fff; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-weight: 600; }}
+  #end-call-btn:hover {{ background: #e74c3c; }}
   .pagination {{ display: flex; align-items: center; gap: 12px; margin: 20px 0; flex-wrap: wrap; }}
   .page-btn {{ color: #1D9E75; text-decoration: none; padding: 6px 12px; border: 1px solid #1D9E75; border-radius: 6px; }}
   .page-btn:hover {{ background: #1D9E75; color: #111; }}
   .page-btn.disabled {{ color: #555; border-color: #333; cursor: not-allowed; }}
   .page-info {{ color: #ccc; }}
+  .test-dial-box {{ background: #1a1a1a; border: 1px solid #1D9E75; border-radius: 8px; padding: 16px; margin-bottom: 16px; }}
+  .test-dial-box input {{ background: #222; color: #fff; border: 1px solid #444; border-radius: 6px; padding: 8px 12px; margin: 0 10px; width: 200px; }}
 </style>
 </head>
 <body>
@@ -145,7 +160,15 @@ async def dialer_page(request: Request) -> HTMLResponse:
   <div class="mode-toggle">
     <label><input type="checkbox" id="humanMode"> Human mode (I'll dial manually from TextNow/Google Voice)</label>
   </div>
-  <div id="lock-banner">A call is currently in progress. Wait for it to finish before dialing the next contractor.</div>
+  <div class="test-dial-box">
+    <strong>Test call</strong> (doesn't touch any contractor data, won't use a real name/business in Maya's greeting):
+    <input type="tel" id="testPhoneInput" placeholder="+19195551234" />
+    <button class="call-btn" onclick="dialTest()">Call this number</button>
+  </div>
+  <div id="lock-banner">
+    <span id="lock-status-text">A call is currently in progress.</span>
+    <button id="end-call-btn" onclick="endCall()">End Call</button>
+  </div>
   {pagination_html}
   <table>
     <tr><th>Owner</th><th>Business</th><th>Phone</th><th>Email</th><th>Status</th><th></th></tr>
@@ -154,6 +177,80 @@ async def dialer_page(request: Request) -> HTMLResponse:
   {pagination_html}
 
 <script>
+const STATUS_LABELS = {{
+    'initiating': 'Placing call...',
+    'initiated': 'Call initiated...',
+    'ringing': 'Ringing...',
+    'in-progress': 'Connected - call in progress',
+    'completed': 'Call ended',
+    'busy': 'Line busy',
+    'no-answer': 'No answer',
+    'failed': 'Call failed',
+    'canceled': 'Call canceled',
+}};
+
+async function pollCallStatus() {{
+    try {{
+        const resp = await fetch('/dialer/lock-status');
+        const data = await resp.json();
+        const banner = document.getElementById('lock-banner');
+        const statusText = document.getElementById('lock-status-text');
+
+        if (data.in_progress) {{
+            banner.classList.add('active');
+            const label = STATUS_LABELS[data.status] || data.status || 'In progress...';
+            statusText.innerText = label + (data.phone ? ' (' + data.phone + ')' : '');
+        }} else {{
+            banner.classList.remove('active');
+        }}
+    }} catch (e) {{
+        // Silent fail on a poll - not worth alerting the user over a missed poll
+    }}
+}}
+setInterval(pollCallStatus, 2000);
+pollCallStatus();
+
+async function endCall() {{
+    if (!confirm('End the current call now?')) return;
+    try {{
+        const resp = await fetch('/dialer/end-call', {{ method: 'POST' }});
+        const data = await resp.json();
+        if (!resp.ok) {{
+            alert(data.error || 'Could not end call.');
+            return;
+        }}
+        pollCallStatus();
+    }} catch (e) {{
+        alert('Request failed: ' + e);
+    }}
+}}
+
+async function dialTest() {{
+    const phone = document.getElementById('testPhoneInput').value.trim();
+    if (!phone) {{
+        alert('Enter a phone number first.');
+        return;
+    }}
+
+    try {{
+        const resp = await fetch('/dialer/dial', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ phone: phone, mode: 'ai', is_test: true }})
+        }});
+        const data = await resp.json();
+
+        if (!resp.ok) {{
+            alert(data.error || 'Call could not be placed.');
+            return;
+        }}
+
+        alert('Calling ' + phone + ' now - answer your phone.');
+    }} catch (e) {{
+        alert('Request failed: ' + e);
+    }}
+}}
+
 async function dial(phone, businessEntity, btn) {{
     const humanMode = document.getElementById('humanMode').checked;
     btn.disabled = true;
@@ -199,11 +296,16 @@ async def dial(request: Request) -> JSONResponse:
     """Place exactly one outbound call (AI mode) or mark one contractor as
     manually dialed (human mode). Enforces the single-call-at-a-time lock
     in AI mode.
+
+    is_test=true skips all contractor status updates - used for the manual
+    test-dial box (calling your own number to hear Maya live) so testing
+    never touches real contractor data.
     """
     body = await request.json()
     phone = body.get("phone")
     business_entity = body.get("business_entity", "CO-003")
     mode = body.get("mode", "ai")
+    is_test = bool(body.get("is_test", False))
 
     if not phone:
         return JSONResponse({"error": "phone is required"}, status_code=400)
@@ -211,13 +313,12 @@ async def dial(request: Request) -> JSONResponse:
     normalized = normalize_phone(phone)
 
     if mode == "human":
-        # No call placed by us at all - just record that a human is about
-        # to dial this contractor manually.
-        await update_contractor_status(
-            phone=normalized,
-            business_entity=business_entity,
-            status="dialed_manual",
-        )
+        if not is_test:
+            await update_contractor_status(
+                phone=normalized,
+                business_entity=business_entity,
+                status="dialed_manual",
+            )
         return JSONResponse({"success": True, "mode": "human", "phone": normalized})
 
     # --- AI mode: this is the path that must stay single-call-only ---
@@ -229,6 +330,9 @@ async def dial(request: Request) -> JSONResponse:
 
     _active_call_lock["in_progress"] = True
     _active_call_lock["phone"] = normalized
+    _active_call_lock["call_sid"] = None
+    _active_call_lock["status"] = "initiating"
+    _active_call_lock["answered_by"] = None
     _active_call_lock["started_at"] = datetime.now(timezone.utc).isoformat()
 
     try:
@@ -238,11 +342,13 @@ async def dial(request: Request) -> JSONResponse:
             from_=TWILIO_PHONE_NUMBER,
             url=_incoming_call_webhook_url(),
             status_callback=_status_callback_url(),
-            status_callback_event=["completed"],
+            status_callback_event=["initiated", "ringing", "answered", "completed"],
             status_callback_method="POST",
         )
-        await update_contractor_status(phone=normalized, business_entity=business_entity, status="dialed")
-        logger.info(f"[DIALER] Outbound call placed to {normalized}, CallSid={call.sid}")
+        _active_call_lock["call_sid"] = call.sid
+        if not is_test:
+            await update_contractor_status(phone=normalized, business_entity=business_entity, status="dialed")
+        logger.info(f"[DIALER] Outbound call placed to {normalized}, CallSid={call.sid} (test={is_test})")
         return JSONResponse({"success": True, "mode": "ai", "call_sid": call.sid})
     except Exception as e:
         # Release the lock immediately on failure to place the call -
@@ -259,9 +365,14 @@ def _status_callback_url() -> str:
 
 
 async def call_status_callback(request: Request) -> JSONResponse:
-    """Twilio hits this when the outbound call completes. This is what
-    actually releases the dial lock - not a timer, not the frontend - so
-    the lock is accurate even if the browser tab was closed mid-call.
+    """Twilio hits this on every call state change (initiated, ringing,
+    answered, completed). We track every update, not just the terminal one -
+    the dialer page polls /dialer/lock-status to show live progress
+    (ringing -> in-progress -> ended).
+
+    The lock itself (in_progress) only releases on a terminal status - that's
+    still what enforces single-call-at-a-time, unaffected by the extra
+    intermediate updates.
     """
     form = await request.form()
     call_status = form.get("CallStatus")
@@ -269,12 +380,41 @@ async def call_status_callback(request: Request) -> JSONResponse:
 
     logger.info(f"[DIALER] Call status callback: CallSid={call_sid} status={call_status}")
 
+    # Only update if this callback matches the call we're currently tracking -
+    # guards against a stale/late callback from a previous call overwriting
+    # the state of a new one (unlikely given the lock, but cheap to check).
+    if _active_call_lock.get("call_sid") in (None, call_sid):
+        _active_call_lock["call_sid"] = call_sid
+        _active_call_lock["status"] = call_status
+
     if call_status in ("completed", "failed", "busy", "no-answer", "canceled"):
         _active_call_lock["in_progress"] = False
         _active_call_lock["phone"] = None
+        _active_call_lock["call_sid"] = None
+        _active_call_lock["status"] = None
+        _active_call_lock["answered_by"] = None
         _active_call_lock["started_at"] = None
 
     return JSONResponse({"ok": True})
+
+
+async def end_call(request: Request) -> JSONResponse:
+    """Manually hang up the currently active outbound call. Lets Capital
+    bail out of a stuck or unwanted live call from the dialer page instead
+    of waiting for it to end naturally.
+    """
+    call_sid = _active_call_lock.get("call_sid")
+    if not call_sid:
+        return JSONResponse({"error": "No active call to end."}, status_code=404)
+
+    try:
+        twilio_client = _get_twilio_client()
+        await asyncio.to_thread(twilio_client.calls(call_sid).update, status="completed")
+        logger.info(f"[DIALER] Manually ended call {call_sid}")
+        return JSONResponse({"success": True, "call_sid": call_sid})
+    except Exception as e:
+        logger.error(f"[DIALER] Failed to end call {call_sid}: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 async def dialer_lock_status(request: Request) -> JSONResponse:
