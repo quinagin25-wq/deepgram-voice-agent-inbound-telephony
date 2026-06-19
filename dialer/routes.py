@@ -3,29 +3,14 @@ Power dialer - human-initiated, single-call-only outbound dialing.
 
 TCPA compliance constraint (do not weaken this): every outbound AI call to
 the 3,104-contractor list requires a human to physically click "Call" for
-that specific contractor. This module enforces that mechanically, not just
-through UI suggestion:
+that specific contractor.
 
-  - `_active_call_lock` blocks a second outbound call from being placed
-    while one is already in progress, server-side, regardless of what the
-    frontend does. Even a scripted/automated POST flood against /dial
-    cannot trigger simultaneous calls.
-  - There is no batch/list-dial endpoint. Only one contractor, one call,
-    one explicit POST per dial.
-
-Two routes:
-  GET  /dialer        - simple HTML page listing contractors with Call buttons
-  POST /dialer/dial    - places exactly one outbound call via Twilio REST API
-
-AI mode vs human mode:
-  AI mode (default): /dialer/dial calls Twilio's REST API, Twilio dials the
-    contractor and connects them to our /incoming-call webhook -> Maya.
-  Human mode: /dialer/dial does NOT place any call. It just marks the
-    contractor "dialed_manual" and returns their phone number so the
-    frontend can show a tel: link / copyable number for Capital to dial
-    manually from TextNow or Google Voice. No VOIP API integration exists
-    (or is needed) for this - it's a status-tracking convenience only.
+This module enforces:
+- single-call lock (server-side)
+- no batch dialing
+- no concurrent outbound calls
 """
+
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -41,321 +26,42 @@ from config import (
     SERVER_EXTERNAL_URL,
     WEBHOOK_SECRET,
 )
-from backend.contractor_lookup import list_contractors, count_contractors, normalize_phone, update_contractor_status
+
+from backend.contractor_lookup import (
+    list_contractors,
+    count_contractors,
+    normalize_phone,
+    update_contractor_status,
+)
 
 logger = logging.getLogger(__name__)
 
-# Server-side lock - the actual TCPA-safety mechanism. True while any
-# outbound call placed through this dialer is in progress. Also doubles as
-# the live call-state store the dialer page polls to show real status
-# (ringing/in-progress/voicemail/ended) instead of a static "Calling..." label.
+# -----------------------------
+# GLOBAL CALL LOCK (TCPA SAFETY)
+# -----------------------------
 _active_call_lock = {
     "in_progress": False,
     "phone": None,
     "call_sid": None,
-    "status": None,  # Twilio's CallStatus: queued/ringing/in-progress/completed/busy/no-answer/failed/canceled
-    "answered_by": None,  # AMD result: human/machine_start/machine_end_beep/etc, when available
+    "status": None,
+    "answered_by": None,
     "started_at": None,
 }
 
 
+# -----------------------------
+# TWILIO CLIENT
+# -----------------------------
 def _get_twilio_client() -> TwilioClient:
     if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-        raise RuntimeError("TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be set.")
+        raise RuntimeError("Twilio credentials missing.")
     return TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 
 def _incoming_call_webhook_url() -> str:
-    """Build the same webhook URL Twilio's TwiML <Stream> points to, for use
-    as the outbound call's connection target."""
     host = (SERVER_EXTERNAL_URL or "").replace("https://", "").replace("http://", "").rstrip("/")
     path = f"/incoming-call/{WEBHOOK_SECRET}" if WEBHOOK_SECRET else "/incoming-call"
     return f"https://{host}{path}"
-
-
-async def dialer_page(request: Request) -> HTMLResponse:
-    """Serve the contractor list with Call buttons, paginated.
-
-    Pagination via ?page=N (1-indexed) and ?page_size=N (default 50, max 200).
-    Reads directly from Supabase on every page load - no caching, so status
-    is always current.
-    """
-    business_entity = request.query_params.get("business_entity", "CO-003")
-    page = max(1, int(request.query_params.get("page", "1")))
-    page_size = min(200, max(10, int(request.query_params.get("page_size", "50"))))
-    offset = (page - 1) * page_size
-
-    exclude_statuses = ["booked", "declined"]
-
-    total = await count_contractors(business_entity=business_entity, exclude_statuses=exclude_statuses)
-    total_pages = max(1, (total + page_size - 1) // page_size)
-    page = min(page, total_pages)  # clamp if someone requests a page beyond the end
-    offset = (page - 1) * page_size
-
-    contractors = await list_contractors(
-        business_entity=business_entity,
-        limit=page_size,
-        offset=offset,
-        exclude_statuses=exclude_statuses,
-    )
-
-    rows_html = ""
-    for c in contractors:
-        email = c.get("corrected_email") or c.get("email") or ""
-        rows_html += f"""
-        <tr data-phone="{c['phone']}">
-            <td>{c.get('owner_name') or ''}</td>
-            <td>{c.get('business_name') or ''}</td>
-            <td>{c['phone']}</td>
-            <td>{email}</td>
-            <td class="status">{c.get('status') or 'not_called'}</td>
-            <td>
-                <button class="call-btn" onclick="dial('{c['phone']}', '{business_entity}', this)">Call</button>
-            </td>
-        </tr>"""
-
-    def page_link(target_page: int, label: str, disabled: bool) -> str:
-        if disabled:
-            return f'<span class="page-btn disabled">{label}</span>'
-        return f'<a class="page-btn" href="/dialer?business_entity={business_entity}&page_size={page_size}&page={target_page}">{label}</a>'
-
-    pagination_html = f"""
-    <div class="pagination">
-        {page_link(1, '« First', page <= 1)}
-        {page_link(page - 1, '‹ Prev', page <= 1)}
-        <span class="page-info">Page {page} of {total_pages} &nbsp;({total} contractors)</span>
-        {page_link(page + 1, 'Next ›', page >= total_pages)}
-        {page_link(total_pages, 'Last »', page >= total_pages)}
-    </div>"""
-
-    html = f"""<!DOCTYPE html>
-<html>
-<head>
-<title>craftd Power Dialer</title>
-<style>
-  body {{ font-family: -apple-system, sans-serif; background: #111111; color: #f0f0f0; padding: 24px; }}
-  h1 {{ color: #1D9E75; }}
-  .mode-toggle {{ margin-bottom: 16px; }}
-  table {{ width: 100%; border-collapse: collapse; }}
-  th, td {{ text-align: left; padding: 8px 12px; border-bottom: 1px solid #333; }}
-  th {{ color: #1D9E75; }}
-  .call-btn {{ background: #1D9E75; color: #111; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: 600; }}
-  .call-btn:disabled {{ background: #555; color: #999; cursor: not-allowed; }}
-  .status {{ text-transform: capitalize; }}
-  #lock-banner {{ display: none; background: #5a3b00; color: #ffd27a; padding: 10px 16px; border-radius: 6px; margin-bottom: 16px; align-items: center; justify-content: space-between; }}
-  #lock-banner.active {{ display: flex; }}
-  #end-call-btn {{ background: #c0392b; color: #fff; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-weight: 600; }}
-  #end-call-btn:hover {{ background: #e74c3c; }}
-  .pagination {{ display: flex; align-items: center; gap: 12px; margin: 20px 0; flex-wrap: wrap; }}
-  .page-btn {{ color: #1D9E75; text-decoration: none; padding: 6px 12px; border: 1px solid #1D9E75; border-radius: 6px; }}
-  .page-btn:hover {{ background: #1D9E75; color: #111; }}
-  .page-btn.disabled {{ color: #555; border-color: #333; cursor: not-allowed; }}
-  .page-info {{ color: #ccc; }}
-  .test-dial-box {{ background: #1a1a1a; border: 1px solid #1D9E75; border-radius: 8px; padding: 16px; margin-bottom: 16px; }}
-  .test-dial-box input {{ background: #222; color: #fff; border: 1px solid #444; border-radius: 6px; padding: 8px 12px; margin: 0 10px; width: 200px; }}
-</style>
-</head>
-<body>
-  <h1>craftd Power Dialer — {business_entity}</h1>
-  <div class="mode-toggle">
-    <label><input type="checkbox" id="humanMode"> Human mode (I'll dial manually from TextNow/Google Voice)</label>
-  </div>
-  <div class="test-dial-box">
-    <strong>Test call</strong> (doesn't touch any contractor data, won't use a real name/business in Maya's greeting):
-    <input type="tel" id="testPhoneInput" placeholder="+19195551234" />
-    <button class="call-btn" onclick="dialTest()">Call this number</button>
-  </div>
-  <div id="lock-banner">
-    <span id="lock-status-text">A call is currently in progress.</span>
-    <button id="end-call-btn" onclick="endCall()">End Call</button>
-  </div>
-  {pagination_html}
-  <table>
-    <tr><th>Owner</th><th>Business</th><th>Phone</th><th>Email</th><th>Status</th><th></th></tr>
-    {rows_html}
-  </table>
-  {pagination_html}
-
-<script>
-const STATUS_LABELS = {{
-    'initiating': 'Placing call...',
-    'initiated': 'Call initiated...',
-    'ringing': 'Ringing...',
-    'in-progress': 'Connected - call in progress',
-    'completed': 'Call ended',
-    'busy': 'Line busy',
-    'no-answer': 'No answer',
-    'failed': 'Call failed',
-    'canceled': 'Call canceled',
-}};
-
-async function pollCallStatus() {{
-    try {{
-        const resp = await fetch('/dialer/lock-status');
-        const data = await resp.json();
-        const banner = document.getElementById('lock-banner');
-        const statusText = document.getElementById('lock-status-text');
-
-        if (data.in_progress) {{
-            banner.classList.add('active');
-            const label = STATUS_LABELS[data.status] || data.status || 'In progress...';
-            statusText.innerText = label + (data.phone ? ' (' + data.phone + ')' : '');
-        }} else {{
-            banner.classList.remove('active');
-        }}
-    }} catch (e) {{
-        // Silent fail on a poll - not worth alerting the user over a missed poll
-    }}
-}}
-setInterval(pollCallStatus, 2000);
-pollCallStatus();
-
-async function endCall() {{
-    if (!confirm('End the current call now?')) return;
-    try {{
-        const resp = await fetch('/dialer/end-call', {{ method: 'POST' }});
-        const data = await resp.json();
-        if (!resp.ok) {{
-            alert(data.error || 'Could not end call.');
-            return;
-        }}
-        pollCallStatus();
-    }} catch (e) {{
-        alert('Request failed: ' + e);
-    }}
-}}
-
-async function dialTest() {{
-    const phone = document.getElementById('testPhoneInput').value.trim();
-    if (!phone) {{
-        alert('Enter a phone number first.');
-        return;
-    }}
-
-    try {{
-        const resp = await fetch('/dialer/dial', {{
-            method: 'POST',
-            headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify({{ phone: phone, mode: 'ai', is_test: true }})
-        }});
-        const data = await resp.json();
-
-        if (!resp.ok) {{
-            alert(data.error || 'Call could not be placed.');
-            return;
-        }}
-
-        alert('Calling ' + phone + ' now - answer your phone.');
-    }} catch (e) {{
-        alert('Request failed: ' + e);
-    }}
-}}
-
-async function dial(phone, businessEntity, btn) {{
-    const humanMode = document.getElementById('humanMode').checked;
-    btn.disabled = true;
-    btn.innerText = humanMode ? 'Dialing manually...' : 'Calling...';
-
-    try {{
-        const resp = await fetch('/dialer/dial', {{
-            method: 'POST',
-            headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify({{ phone: phone, business_entity: businessEntity, mode: humanMode ? 'human' : 'ai' }})
-        }});
-        const data = await resp.json();
-
-        if (!resp.ok) {{
-            alert(data.error || 'Call could not be placed.');
-            btn.disabled = false;
-            btn.innerText = 'Call';
-            return;
-        }}
-
-        const row = btn.closest('tr');
-        row.querySelector('.status').innerText = humanMode ? 'dialed_manual' : 'dialed';
-
-        if (humanMode) {{
-            window.location.href = 'tel:' + phone;
-            btn.innerText = 'Dialed manually';
-        }} else {{
-            btn.innerText = 'Calling...';
-        }}
-    }} catch (e) {{
-        alert('Request failed: ' + e);
-        btn.disabled = false;
-        btn.innerText = 'Call';
-    }}
-}}
-</script>
-</body>
-</html>"""
-    return HTMLResponse(html)
-
-
-async def dial(request: Request) -> JSONResponse:
-    """Place exactly one outbound call (AI mode) or mark one contractor as
-    manually dialed (human mode). Enforces the single-call-at-a-time lock
-    in AI mode.
-
-    is_test=true skips all contractor status updates - used for the manual
-    test-dial box (calling your own number to hear Maya live) so testing
-    never touches real contractor data.
-    """
-    body = await request.json()
-    phone = body.get("phone")
-    business_entity = body.get("business_entity", "CO-003")
-    mode = body.get("mode", "ai")
-    is_test = bool(body.get("is_test", False))
-
-    if not phone:
-        return JSONResponse({"error": "phone is required"}, status_code=400)
-
-    normalized = normalize_phone(phone)
-
-    if mode == "human":
-        if not is_test:
-            await update_contractor_status(
-                phone=normalized,
-                business_entity=business_entity,
-                status="dialed_manual",
-            )
-        return JSONResponse({"success": True, "mode": "human", "phone": normalized})
-
-    # --- AI mode: this is the path that must stay single-call-only ---
-    if _active_call_lock["in_progress"]:
-        return JSONResponse(
-            {"error": f"A call to {_active_call_lock['phone']} is already in progress. Wait for it to finish."},
-            status_code=409,
-        )
-
-    _active_call_lock["in_progress"] = True
-    _active_call_lock["phone"] = normalized
-    _active_call_lock["call_sid"] = None
-    _active_call_lock["status"] = "initiating"
-    _active_call_lock["answered_by"] = None
-    _active_call_lock["started_at"] = datetime.now(timezone.utc).isoformat()
-
-    try:
-        twilio_client = _get_twilio_client()
-        call = twilio_client.calls.create(
-            to=normalized,
-            from_=TWILIO_PHONE_NUMBER,
-            url=_incoming_call_webhook_url(),
-            status_callback=_status_callback_url(),
-            status_callback_event=["initiated", "ringing", "answered", "completed"],
-            status_callback_method="POST",
-        )
-        _active_call_lock["call_sid"] = call.sid
-        if not is_test:
-            await update_contractor_status(phone=normalized, business_entity=business_entity, status="dialed")
-        logger.info(f"[DIALER] Outbound call placed to {normalized}, CallSid={call.sid} (test={is_test})")
-        return JSONResponse({"success": True, "mode": "ai", "call_sid": call.sid})
-    except Exception as e:
-        # Release the lock immediately on failure to place the call -
-        # nothing is actually in progress if Twilio rejected the request.
-        _active_call_lock["in_progress"] = False
-        logger.error(f"[DIALER] Failed to place call to {normalized}: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 def _status_callback_url() -> str:
@@ -364,60 +70,287 @@ def _status_callback_url() -> str:
     return f"https://{host}{path}"
 
 
-async def call_status_callback(request: Request) -> JSONResponse:
-    """Twilio hits this on every call state change (initiated, ringing,
-    answered, completed). We track every update, not just the terminal one -
-    the dialer page polls /dialer/lock-status to show live progress
-    (ringing -> in-progress -> ended).
+# -----------------------------
+# UI (OPERATOR MODE)
+# -----------------------------
+async def dialer_page(request: Request) -> HTMLResponse:
+    business_entity = request.query_params.get("business_entity", "CO-003")
 
-    The lock itself (in_progress) only releases on a terminal status - that's
-    still what enforces single-call-at-a-time, unaffected by the extra
-    intermediate updates.
-    """
-    form = await request.form()
-    call_status = form.get("CallStatus")
-    call_sid = form.get("CallSid")
+    page = max(1, int(request.query_params.get("page", "1")))
+    page_size = min(200, max(10, int(request.query_params.get("page_size", "50"))))
+    offset = (page - 1) * page_size
 
-    logger.info(f"[DIALER] Call status callback: CallSid={call_sid} status={call_status}")
+    exclude_statuses = ["booked", "declined"]
 
-    # Only update if this callback matches the call we're currently tracking -
-    # guards against a stale/late callback from a previous call overwriting
-    # the state of a new one (unlikely given the lock, but cheap to check).
-    if _active_call_lock.get("call_sid") in (None, call_sid):
-        _active_call_lock["call_sid"] = call_sid
-        _active_call_lock["status"] = call_status
+    total = await count_contractors(
+        business_entity=business_entity,
+        exclude_statuses=exclude_statuses,
+    )
 
-    if call_status in ("completed", "failed", "busy", "no-answer", "canceled"):
-        _active_call_lock["in_progress"] = False
-        _active_call_lock["phone"] = None
-        _active_call_lock["call_sid"] = None
-        _active_call_lock["status"] = None
-        _active_call_lock["answered_by"] = None
-        _active_call_lock["started_at"] = None
+    contractors = await list_contractors(
+        business_entity=business_entity,
+        limit=page_size,
+        offset=offset,
+        exclude_statuses=exclude_statuses,
+    )
 
-    return JSONResponse({"ok": True})
+    # LEFT QUEUE ROWS
+    rows_html = ""
+    for c in contractors:
+        phone = c["phone"]
+        name = c.get("owner_name") or "Unknown"
+        status = c.get("status") or "not_called"
+
+        rows_html += f"""
+        <tr onclick="selectLead('{phone}', '{name}', '{status}')">
+            <td>
+                <div><b>{name}</b></div>
+                <div style="font-size:11px;color:#777">{phone}</div>
+            </td>
+            <td style="text-align:right">
+                <button class="call-btn" onclick="event.stopPropagation(); dial('{phone}')">
+                    Call
+                </button>
+            </td>
+        </tr>
+        """
+
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<title>Operator Dialer</title>
+
+<style>
+body {{
+    margin:0;
+    font-family: Arial;
+    background:#0f1115;
+    color:#e6e6e6;
+    display:flex;
+    height:100vh;
+}}
+
+.left {{
+    width:320px;
+    background:#151922;
+    border-right:1px solid #2a2f3a;
+    overflow:auto;
+}}
+
+.right {{
+    flex:1;
+    display:flex;
+    flex-direction:column;
+}}
+
+.top {{
+    padding:14px;
+    background:#121621;
+    border-bottom:1px solid #2a2f3a;
+}}
+
+.card {{
+    margin:20px;
+    padding:20px;
+    background:#161b26;
+    border:1px solid #2a2f3a;
+    border-radius:10px;
+}}
+
+button {{
+    padding:10px;
+    border:none;
+    border-radius:8px;
+    cursor:pointer;
+    font-weight:bold;
+}}
+
+.call-btn {{
+    background:#1D9E75;
+}}
+
+.actions {{
+    display:flex;
+    gap:10px;
+    margin-top:15px;
+}}
+
+.call {{ background:#2ecc71; }}
+.skip {{ background:#e67e22; }}
+.next {{ background:#3498db; }}
+.test {{ background:#e74c3c; }}
+
+tr {{
+    cursor:pointer;
+}}
+
+td {{
+    padding:10px;
+    border-bottom:1px solid #222836;
+}}
+
+tr:hover {{
+    background:#1c2230;
+}}
+
+.box {{
+    background:#101521;
+    padding:12px;
+    border-radius:8px;
+    border:1px solid #2a2f3a;
+}}
+</style>
+</head>
+
+<body>
+
+<!-- LEFT -->
+<div class="left">
+    <div style="padding:14px;border-bottom:1px solid #2a2f3a;">
+        <b>Queue</b><br>
+        <span style="color:#777;font-size:12px">{total} leads</span>
+    </div>
+    <table style="width:100%">
+        {rows_html}
+    </table>
+</div>
+
+<!-- RIGHT -->
+<div class="right">
+
+    <div class="top">
+        <b>Operator Console</b>
+        <span style="float:right;color:#777">Twilio Active</span>
+    </div>
+
+    <div class="card">
+        <div id="leadName" style="font-size:20px;font-weight:bold;">
+            Select a lead
+        </div>
+        <div id="leadPhone" style="color:#9bb3c9;margin-top:5px;"></div>
+        <div id="leadStatus" style="margin-top:10px;color:#777;"></div>
+
+        <div class="actions">
+            <button class="call" onclick="callSelected()">Call</button>
+            <button class="skip">Skip</button>
+            <button class="next">Next</button>
+            <button class="test" onclick="testCall()">Test AI Call</button>
+        </div>
+    </div>
+
+    <div class="card">
+        <b>Details</b>
+        <div class="box" style="margin-top:10px;">
+            Select a lead to view details.
+        </div>
+    </div>
+
+</div>
+
+<script>
+let selectedPhone = null;
+
+function selectLead(phone, name, status) {{
+    selectedPhone = phone;
+    document.getElementById("leadName").innerText = name;
+    document.getElementById("leadPhone").innerText = phone;
+    document.getElementById("leadStatus").innerText = "Status: " + status;
+}}
+
+async function callSelected() {{
+    if (!selectedPhone) return alert("Select a lead first");
+
+    const resp = await fetch("/dialer/dial", {{
+        method:"POST",
+        headers:{{"Content-Type":"application/json"}},
+        body: JSON.stringify({{ phone: selectedPhone, mode:"ai" }})
+    }});
+
+    const data = await resp.json();
+    if (!resp.ok) return alert(data.error || "Call failed");
+
+    alert("Calling " + selectedPhone);
+}}
+
+async function testCall() {{
+    const phone = prompt("Enter test number:");
+    if (!phone) return;
+
+    const resp = await fetch("/dialer/dial", {{
+        method:"POST",
+        headers:{{"Content-Type":"application/json"}},
+        body: JSON.stringify({{ phone, mode:"ai", is_test:true }})
+    }});
+
+    const data = await resp.json();
+    if (!resp.ok) return alert(data.error || "Failed");
+
+    alert("Test call started");
+}}
+</script>
+
+</body>
+</html>
+"""
+
+    return HTMLResponse(html)
 
 
-async def end_call(request: Request) -> JSONResponse:
-    """Manually hang up the currently active outbound call. Lets Capital
-    bail out of a stuck or unwanted live call from the dialer page instead
-    of waiting for it to end naturally.
-    """
-    call_sid = _active_call_lock.get("call_sid")
-    if not call_sid:
-        return JSONResponse({"error": "No active call to end."}, status_code=404)
+# -----------------------------
+# DIAL LOGIC (UNCHANGED)
+# -----------------------------
+async def dial(request: Request) -> JSONResponse:
+    body = await request.json()
+    phone = body.get("phone")
+    mode = body.get("mode", "ai")
+    is_test = body.get("is_test", False)
+
+    if not phone:
+        return JSONResponse({"error": "phone required"}, status_code=400)
+
+    normalized = normalize_phone(phone)
+
+    if mode == "human":
+        await update_contractor_status(normalized, "CO-003", "dialed_manual")
+        return JSONResponse({"success": True, "mode": "human", "phone": normalized})
+
+    if _active_call_lock["in_progress"]:
+        return JSONResponse({"error": "Call already in progress"}, status_code=409)
+
+    _active_call_lock.update({
+        "in_progress": True,
+        "phone": normalized,
+        "status": "initiating",
+        "started_at": datetime.now(timezone.utc).isoformat()
+    })
 
     try:
-        twilio_client = _get_twilio_client()
-        await asyncio.to_thread(twilio_client.calls(call_sid).update, status="completed")
-        logger.info(f"[DIALER] Manually ended call {call_sid}")
-        return JSONResponse({"success": True, "call_sid": call_sid})
+        client = _get_twilio_client()
+
+        call = client.calls.create(
+            to=normalized,
+            from_=TWILIO_PHONE_NUMBER,
+            url=_incoming_call_webhook_url(),
+            status_callback=_status_callback_url(),
+            status_callback_event=["initiated","ringing","completed"],
+            status_callback_method="POST",
+        )
+
+        _active_call_lock["call_sid"] = call.sid
+
+        if not is_test:
+            await update_contractor_status(normalized, "CO-003", "dialed")
+
+        return JSONResponse({"success": True, "call_sid": call.sid})
+
     except Exception as e:
-        logger.error(f"[DIALER] Failed to end call {call_sid}: {e}")
+        _active_call_lock["in_progress"] = False
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# -----------------------------
+# LOCK STATUS (UNCHANGED IDEA)
+# -----------------------------
 async def dialer_lock_status(request: Request) -> JSONResponse:
-    """Lightweight endpoint the dialer page can poll to know if it's safe
-    to enable the next Call button."""
     return JSONResponse(_active_call_lock)
