@@ -54,18 +54,31 @@ def normalize_phone(phone: str) -> str:
     return f"+{digits}"
 
 
-async def list_contractors(business_entity: str = "CO-003", limit: int = 50, exclude_statuses: Optional[list] = None) -> list:
+async def list_contractors(business_entity: str = "CO-003", limit: int = 50, offset: int = 0, exclude_statuses: Optional[list] = None) -> list:
     """List contractors for a business entity, optionally excluding certain
     statuses (e.g. already-booked or declined contractors the dialer
-    shouldn't show). Used by the power dialer page.
+    shouldn't show). Used by the power dialer page. offset enables pagination.
     """
     exclude_statuses = exclude_statuses or []
     client = _get_client()
     query = client.table("contractors").select("*").eq("business_entity", business_entity)
     for status in exclude_statuses:
         query = query.neq("status", status)
-    resp = query.order("status").limit(limit).execute()
+    resp = query.order("status").order("business_name").range(offset, offset + limit - 1).execute()
     return resp.data or []
+
+
+async def count_contractors(business_entity: str = "CO-003", exclude_statuses: Optional[list] = None) -> int:
+    """Total count of contractors for a business entity, with the same status
+    filtering as list_contractors. Used to compute total pages for the dialer.
+    """
+    exclude_statuses = exclude_statuses or []
+    client = _get_client()
+    query = client.table("contractors").select("id", count="exact").eq("business_entity", business_entity)
+    for status in exclude_statuses:
+        query = query.neq("status", status)
+    resp = query.limit(1).execute()
+    return resp.count or 0
 
 
 async def get_contractor_by_phone(phone: str, business_entity: str = "CO-003") -> Optional[dict]:
