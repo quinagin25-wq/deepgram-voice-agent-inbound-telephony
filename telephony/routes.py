@@ -4,9 +4,11 @@ Telephony routes - handles Twilio webhook and audio stream.
 Two endpoints:
 
   POST /incoming-call
-    Twilio hits this when someone calls your phone number.
-    Returns TwiML XML that tells Twilio to open a WebSocket audio stream
-    back to our /twilio endpoint.
+    Twilio hits this when someone calls your phone number (inbound), or
+    when an outbound call we initiated connects (the dialer points
+    Twilio's outbound call at this same webhook). Returns TwiML that
+    tells Twilio to open a WebSocket audio stream back to our /twilio
+    endpoint.
 
   WS /twilio
     Receives the audio stream from Twilio (or from dev_client.py in local mode).
@@ -14,6 +16,18 @@ Two endpoints:
 
 The server doesn't know or care whether the WebSocket connection comes from
 a real Twilio call or from dev_client.py - both send identical messages.
+
+Contractor lookup:
+  Before the WebSocket stream starts, we look up the contractor by phone
+  number in Supabase (backend/contractor_lookup.py) and stash the result
+  in `pending_contractors`, keyed by CallSid. When the WebSocket's "start"
+  event arrives with the matching CallSid, VoiceAgentSession picks up that
+  context so Maya knows who she's talking to (owner_name, business_name,
+  email) before the conversation begins.
+
+  Direction matters for which number is the contractor's:
+    - Inbound call (contractor called us): contractor's number is `From`
+    - Outbound call (dialer called them):   contractor's number is `To`
 
 Security (when deployed via setup.py):
   - WEBHOOK_SECRET: path token on both endpoints - return 404 on mismatch
@@ -29,6 +43,7 @@ from starlette.websockets import WebSocket
 
 from config import SERVER_EXTERNAL_URL, TWILIO_AUTH_TOKEN, WEBHOOK_SECRET
 from voice_agent.session import VoiceAgentSession
+from backend.contractor_lookup import get_contractor_by_phone
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +68,12 @@ def _check_webhook_secret(path_params: dict) -> bool:
 # Active sessions, keyed by call_sid.  Used for monitoring and cleanup.
 active_sessions: dict[str, VoiceAgentSession] = {}
 
+# Contractor records resolved during the /incoming-call webhook, keyed by
+# CallSid, waiting to be picked up once the matching WebSocket "start"
+# event arrives. Entries are popped (not just read) once consumed, so this
+# never grows unbounded.
+pending_contractors: dict[str, dict] = {}
+
 
 async def incoming_call(request: Request) -> Response:
     """Handle Twilio webhook for inbound calls.
@@ -70,17 +91,38 @@ async def incoming_call(request: Request) -> Response:
     if not _check_webhook_secret(request.path_params):
         return Response(status_code=404)
 
+    # Always parse form data - we need it for the contractor lookup
+    # regardless of whether signature validation is on.
+    form_data = await request.form()
+    params = dict(form_data)
+
     # Validate Twilio request signature (only when TWILIO_AUTH_TOKEN is set)
     if _twilio_validator:
-        # Reconstruct the full URL Twilio used to reach us
         url = str(request.url)
-        form_data = await request.form()
-        params = dict(form_data)
         signature = request.headers.get("X-Twilio-Signature", "")
         logger.info(f"[TELEPHONY] Signature validation - url={url} signature={signature[:20] + '...' if signature else 'MISSING'}")
         if not _twilio_validator.validate(url, params, signature):
             logger.warning("[TELEPHONY] Invalid Twilio signature - rejecting request")
             return Response(status_code=404)
+
+    # Resolve the contractor's number based on call direction.
+    # Outbound calls (placed by the dialer) report direction starting with
+    # "outbound"; the contractor is the number we called (`To`).
+    # Inbound calls: the contractor is whoever called us (`From`).
+    call_sid = params.get("CallSid", "unknown")
+    direction = params.get("Direction", "inbound")
+    contractor_number = params.get("To") if direction.startswith("outbound") else params.get("From")
+
+    if contractor_number:
+        contractor = await get_contractor_by_phone(contractor_number)
+        if contractor:
+            pending_contractors[call_sid] = contractor
+            logger.info(
+                f"[TELEPHONY] CallSid={call_sid} matched contractor "
+                f"{contractor.get('owner_name')} / {contractor.get('business_name')}"
+            )
+        else:
+            logger.info(f"[TELEPHONY] CallSid={call_sid} - no contractor record for {contractor_number}")
 
     # Use configured external URL, or fall back to the request's Host header.
     if SERVER_EXTERNAL_URL:
@@ -147,8 +189,16 @@ async def twilio_websocket(websocket: WebSocket):
                 # Twilio sends this first, before "start".  Nothing to do.
                 continue
 
+        # Pick up the contractor record resolved during /incoming-call, if any.
+        # pop() so this dict never grows unbounded across calls.
+        contractor = pending_contractors.pop(call_sid, None)
+        if contractor:
+            logger.info(f"[TELEPHONY] CallSid={call_sid} - using contractor context for {contractor.get('owner_name')}")
+        else:
+            logger.info(f"[TELEPHONY] CallSid={call_sid} - no contractor context, Maya will use generic greeting")
+
         # Create and start the voice agent session.
-        session = VoiceAgentSession(websocket, call_sid, stream_sid)
+        session = VoiceAgentSession(websocket, call_sid, stream_sid, contractor=contractor)
         active_sessions[call_sid] = session
 
         await session.start()
