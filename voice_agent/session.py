@@ -141,3 +141,23 @@ class VoiceAgentSession:
                     if isinstance(raw_message, bytes):
                         parsed = raw_message
                     else:
+                        json_data = json.loads(raw_message)
+                        parsed = parse_obj_as(V1SocketClientResponse, json_data)
+                except Exception:
+                    msg_type = json_data.get("type", "unknown") if isinstance(raw_message, str) else "binary"
+                    logger.debug(f"[SESSION:{self.call_sid}] Skipping unrecognized message type: {msg_type}")
+                    continue
+
+                if isinstance(parsed, AgentV1SettingsApplied):
+                    self._settings_applied.set()
+                else:
+                    await self._handle_message(parsed)
+        except Exception as e:
+            logger.info(f"[SESSION:{self.call_sid}] Deepgram listen loop ended: {e}")
+        finally:
+            logger.info(f"[SESSION:{self.call_sid}] Deepgram connection closed")
+
+    async def _handle_message(self, message):
+        """Process a single message from the Deepgram Voice Agent."""
+        try:
+            if isinstance(message,
