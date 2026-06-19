@@ -40,7 +40,7 @@ from config import (
     SERVER_EXTERNAL_URL,
     WEBHOOK_SECRET,
 )
-from backend.contractor_lookup import list_contractors, normalize_phone, update_contractor_status
+from backend.contractor_lookup import list_contractors, count_contractors, normalize_phone, update_contractor_status
 
 logger = logging.getLogger(__name__)
 
@@ -64,16 +64,29 @@ def _incoming_call_webhook_url() -> str:
 
 
 async def dialer_page(request: Request) -> HTMLResponse:
-    """Serve the contractor list with Call buttons. Reads directly from
-    Supabase on every page load - no caching, so status is always current.
+    """Serve the contractor list with Call buttons, paginated.
+
+    Pagination via ?page=N (1-indexed) and ?page_size=N (default 50, max 200).
+    Reads directly from Supabase on every page load - no caching, so status
+    is always current.
     """
     business_entity = request.query_params.get("business_entity", "CO-003")
-    limit = int(request.query_params.get("limit", "50"))
+    page = max(1, int(request.query_params.get("page", "1")))
+    page_size = min(200, max(10, int(request.query_params.get("page_size", "50"))))
+    offset = (page - 1) * page_size
+
+    exclude_statuses = ["booked", "declined"]
+
+    total = await count_contractors(business_entity=business_entity, exclude_statuses=exclude_statuses)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(page, total_pages)  # clamp if someone requests a page beyond the end
+    offset = (page - 1) * page_size
 
     contractors = await list_contractors(
         business_entity=business_entity,
-        limit=limit,
-        exclude_statuses=["booked", "declined"],
+        limit=page_size,
+        offset=offset,
+        exclude_statuses=exclude_statuses,
     )
 
     rows_html = ""
@@ -91,6 +104,20 @@ async def dialer_page(request: Request) -> HTMLResponse:
             </td>
         </tr>"""
 
+    def page_link(target_page: int, label: str, disabled: bool) -> str:
+        if disabled:
+            return f'<span class="page-btn disabled">{label}</span>'
+        return f'<a class="page-btn" href="/dialer?business_entity={business_entity}&page_size={page_size}&page={target_page}">{label}</a>'
+
+    pagination_html = f"""
+    <div class="pagination">
+        {page_link(1, '« First', page <= 1)}
+        {page_link(page - 1, '‹ Prev', page <= 1)}
+        <span class="page-info">Page {page} of {total_pages} &nbsp;({total} contractors)</span>
+        {page_link(page + 1, 'Next ›', page >= total_pages)}
+        {page_link(total_pages, 'Last »', page >= total_pages)}
+    </div>"""
+
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -106,6 +133,11 @@ async def dialer_page(request: Request) -> HTMLResponse:
   .call-btn:disabled {{ background: #555; color: #999; cursor: not-allowed; }}
   .status {{ text-transform: capitalize; }}
   #lock-banner {{ display: none; background: #5a3b00; color: #ffd27a; padding: 10px; border-radius: 6px; margin-bottom: 16px; }}
+  .pagination {{ display: flex; align-items: center; gap: 12px; margin: 20px 0; flex-wrap: wrap; }}
+  .page-btn {{ color: #1D9E75; text-decoration: none; padding: 6px 12px; border: 1px solid #1D9E75; border-radius: 6px; }}
+  .page-btn:hover {{ background: #1D9E75; color: #111; }}
+  .page-btn.disabled {{ color: #555; border-color: #333; cursor: not-allowed; }}
+  .page-info {{ color: #ccc; }}
 </style>
 </head>
 <body>
@@ -114,10 +146,12 @@ async def dialer_page(request: Request) -> HTMLResponse:
     <label><input type="checkbox" id="humanMode"> Human mode (I'll dial manually from TextNow/Google Voice)</label>
   </div>
   <div id="lock-banner">A call is currently in progress. Wait for it to finish before dialing the next contractor.</div>
+  {pagination_html}
   <table>
     <tr><th>Owner</th><th>Business</th><th>Phone</th><th>Email</th><th>Status</th><th></th></tr>
     {rows_html}
   </table>
+  {pagination_html}
 
 <script>
 async function dial(phone, businessEntity, btn) {{
