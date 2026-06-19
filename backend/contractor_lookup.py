@@ -35,6 +35,13 @@ def _get_client() -> Client:
     return _client
 
 
+def get_client() -> Client:
+    """Public accessor for the shared Supabase client. Used by modules
+    outside this file (e.g. backend/admin_import.py) that need direct
+    table access beyond the helper functions defined here."""
+    return _get_client()
+
+
 def normalize_phone(phone: str) -> str:
     """Ensure a phone number is in E.164 format (+1XXXXXXXXXX) for lookup.
 
