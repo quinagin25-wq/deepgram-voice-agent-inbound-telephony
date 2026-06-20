@@ -29,6 +29,7 @@ AI mode vs human mode:
 import asyncio
 import logging
 from datetime import datetime, timezone
+from html import escape as html_escape
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
@@ -83,11 +84,12 @@ async def dialer_page(request: Request) -> HTMLResponse:
     business_entity = request.query_params.get("business_entity", "CO-003")
     page = max(1, int(request.query_params.get("page", "1")))
     page_size = min(200, max(10, int(request.query_params.get("page_size", "50"))))
+    q = request.query_params.get("q", "").strip()
     offset = (page - 1) * page_size
 
     exclude_statuses = ["booked", "declined"]
 
-    total = await count_contractors(business_entity=business_entity, exclude_statuses=exclude_statuses)
+    total = await count_contractors(business_entity=business_entity, exclude_statuses=exclude_statuses, search=q or None)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = min(page, total_pages)  # clamp if someone requests a page beyond the end
     offset = (page - 1) * page_size
@@ -97,27 +99,33 @@ async def dialer_page(request: Request) -> HTMLResponse:
         limit=page_size,
         offset=offset,
         exclude_statuses=exclude_statuses,
+        search=q or None,
     )
 
     rows_html = ""
     for c in contractors:
         email = c.get("corrected_email") or c.get("email") or ""
+        row_status = c.get("status") or "not_called"
+        row_notes = html_escape(c.get("call_notes") or "", quote=True)
+        row_callback = html_escape(c.get("callback_at") or "", quote=True)
         rows_html += f"""
-        <tr data-phone="{c['phone']}">
+        <tr data-phone="{c['phone']}" data-status="{row_status}" data-notes="{row_notes}" data-callback-at="{row_callback}">
             <td>{c.get('owner_name') or ''}</td>
             <td>{c.get('business_name') or ''}</td>
             <td>{c['phone']}</td>
             <td>{email}</td>
-            <td class="status">{c.get('status') or 'not_called'}</td>
+            <td class="status">{row_status}</td>
             <td>
                 <button class="call-btn" onclick="dial('{c['phone']}', '{business_entity}', this)">Call</button>
+                <button class="notes-btn" onclick="openNotes(this)">Notes</button>
             </td>
         </tr>"""
 
     def page_link(target_page: int, label: str, disabled: bool) -> str:
         if disabled:
             return f'<span class="page-btn disabled">{label}</span>'
-        return f'<a class="page-btn" href="/dialer?business_entity={business_entity}&page_size={page_size}&page={target_page}">{label}</a>'
+        q_param = f"&q={html_escape(q, quote=True)}" if q else ""
+        return f'<a class="page-btn" href="/dialer?business_entity={business_entity}&page_size={page_size}&page={target_page}{q_param}">{label}</a>'
 
     pagination_html = f"""
     <div class="pagination">
@@ -141,6 +149,12 @@ async def dialer_page(request: Request) -> HTMLResponse:
   th {{ color: #1D9E75; }}
   .call-btn {{ background: #1D9E75; color: #111; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: 600; }}
   .call-btn:disabled {{ background: #555; color: #999; cursor: not-allowed; }}
+  .notes-btn {{ background: transparent; color: #888; border: 1px solid #444; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; margin-left: 6px; }}
+  .notes-btn:hover {{ color: #1D9E75; border-color: #1D9E75; }}
+  .search-box {{ background: #222; color: #fff; border: 1px solid #444; border-radius: 6px; padding: 8px 14px; font-size: 14px; flex: 1; max-width: 400px; }}
+  .search-box:focus {{ outline: none; border-color: #1D9E75; }}
+  .search-clear {{ color: #888; font-size: 13px; text-decoration: none; padding: 4px 8px; }}
+  .search-clear:hover {{ color: #fff; }}
   .status {{ text-transform: capitalize; }}
   #lock-banner {{ display: none; background: #5a3b00; color: #ffd27a; padding: 10px 16px; border-radius: 6px; margin-bottom: 16px; align-items: center; justify-content: space-between; }}
   #lock-banner.active {{ display: flex; }}
@@ -178,6 +192,13 @@ async def dialer_page(request: Request) -> HTMLResponse:
     <span id="lock-status-text">A call is currently in progress.</span>
     <button id="end-call-btn" onclick="endCall()">End Call</button>
   </div>
+  <form method="get" action="/dialer" style="display:flex; gap:8px; margin:16px 0; align-items:center;">
+    <input type="hidden" name="business_entity" value="{business_entity}" />
+    <input type="hidden" name="page_size" value="{page_size}" />
+    <input class="search-box" type="text" name="q" value="{html_escape(q, quote=True)}" placeholder="Search by name, business, or phone..." />
+    <button type="submit" class="call-btn">Search</button>
+    {f'<a class="search-clear" href="/dialer?business_entity={business_entity}&page_size={page_size}">✕ Clear</a>' if q else ''}
+  </form>
   {pagination_html}
   <table>
     <tr><th>Owner</th><th>Business</th><th>Phone</th><th>Email</th><th>Status</th><th></th></tr>
@@ -186,22 +207,50 @@ async def dialer_page(request: Request) -> HTMLResponse:
   {pagination_html}
 
 <script>
+const BUSINESS_ENTITY = '{business_entity}';
+
 let _dispPhone = null;
 let _dispBusiness = null;
 let _dispStatus = null;
 
-function showDispositionPanel(phone, ownerName, businessName, businessEntity) {{
+const DISPOSITION_STATUSES = ['callback_requested', 'booked', 'declined', 'wrong_number', 'dnc'];
+
+function showDispositionPanel(phone, ownerName, businessName, businessEntity, existingStatus, existingNotes, existingCallbackAt) {{
     _dispPhone = phone;
     _dispBusiness = businessEntity;
     _dispStatus = null;
     document.getElementById('disp-name').innerText = ownerName || businessName || '';
     document.getElementById('disp-phone').innerText = phone;
-    document.getElementById('disp-notes').value = '';
+    document.getElementById('disp-notes').value = existingNotes || '';
     document.getElementById('callback-at-input').value = '';
     document.getElementById('callback-row').style.display = 'none';
     document.getElementById('disp-save-btn').disabled = true;
     document.querySelectorAll('.disp-btn').forEach(b => b.classList.remove('selected'));
+
+    if (existingStatus && DISPOSITION_STATUSES.includes(existingStatus)) {{
+        setDisposition(existingStatus);
+    }}
+
+    if (existingCallbackAt) {{
+        try {{
+            const dt = new Date(existingCallbackAt);
+            const local = new Date(dt.getTime() - dt.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+            document.getElementById('callback-at-input').value = local;
+        }} catch(e) {{}}
+    }}
+
     document.getElementById('disposition-panel').style.display = 'block';
+}}
+
+function openNotes(btn) {{
+    const row = btn.closest('tr');
+    const phone = row.dataset.phone;
+    const existingStatus = row.dataset.status || '';
+    const existingNotes = row.dataset.notes || '';
+    const existingCallbackAt = row.dataset.callbackAt || '';
+    const ownerName = row.cells[0].innerText;
+    const businessName = row.cells[1].innerText;
+    showDispositionPanel(phone, ownerName, businessName, BUSINESS_ENTITY, existingStatus, existingNotes, existingCallbackAt);
 }}
 
 function setDisposition(status) {{

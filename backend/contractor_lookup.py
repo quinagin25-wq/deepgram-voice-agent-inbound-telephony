@@ -54,7 +54,23 @@ def normalize_phone(phone: str) -> str:
     return f"+{digits}"
 
 
-async def list_contractors(business_entity: str = "CO-003", limit: int = 50, offset: int = 0, exclude_statuses: Optional[list] = None) -> list:
+def _apply_search(query, search: Optional[str]):
+    """Apply case-insensitive partial match across business_name, owner_name, phone."""
+    if not search:
+        return query
+    safe = search.strip().replace('%', '').replace('_', '').replace(',', '').replace('.', '')
+    if not safe:
+        return query
+    return query.or_(f"business_name.ilike.%{safe}%,owner_name.ilike.%{safe}%,phone.ilike.%{safe}%")
+
+
+async def list_contractors(
+    business_entity: str = "CO-003",
+    limit: int = 50,
+    offset: int = 0,
+    exclude_statuses: Optional[list] = None,
+    search: Optional[str] = None,
+) -> list:
     """List contractors for a business entity, optionally excluding certain
     statuses (e.g. already-booked or declined contractors the dialer
     shouldn't show). Used by the power dialer page. offset enables pagination.
@@ -64,11 +80,16 @@ async def list_contractors(business_entity: str = "CO-003", limit: int = 50, off
     query = client.table("contractors").select("*").eq("business_entity", business_entity)
     for status in exclude_statuses:
         query = query.neq("status", status)
+    query = _apply_search(query, search)
     resp = query.order("status").order("business_name").range(offset, offset + limit - 1).execute()
     return resp.data or []
 
 
-async def count_contractors(business_entity: str = "CO-003", exclude_statuses: Optional[list] = None) -> int:
+async def count_contractors(
+    business_entity: str = "CO-003",
+    exclude_statuses: Optional[list] = None,
+    search: Optional[str] = None,
+) -> int:
     """Total count of contractors for a business entity, with the same status
     filtering as list_contractors. Used to compute total pages for the dialer.
     """
@@ -77,6 +98,7 @@ async def count_contractors(business_entity: str = "CO-003", exclude_statuses: O
     query = client.table("contractors").select("id", count="exact").eq("business_entity", business_entity)
     for status in exclude_statuses:
         query = query.neq("status", status)
+    query = _apply_search(query, search)
     resp = query.limit(1).execute()
     return resp.count or 0
 
