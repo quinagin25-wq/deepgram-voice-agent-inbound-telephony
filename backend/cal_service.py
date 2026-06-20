@@ -40,6 +40,14 @@ class CalService:
 
         Returns up to 5 upcoming slots within the next 7 days, optionally
         filtered to a specific date if the contractor named one.
+
+        NOTE: We intentionally ignore the `date` filter arg from the LLM.
+        The LLM frequently hallucinates wrong years (e.g. 2023 instead of
+        2026) when constructing a date string, which causes all slots to be
+        filtered out. Instead we always return the next 5 available slots
+        across the whole 7-day window and let Maya present them naturally.
+        If the contractor asked for a specific day, Maya can identify the
+        right ones from the returned list herself.
         """
         if not CALCOM_EVENT_TYPE_ID:
             logger.error("[CALCOM] CALCOM_EVENT_TYPE_ID is not set")
@@ -81,37 +89,29 @@ class CalService:
             }
 
         data = resp.json()
-        logger.info(f"[CALCOM] Raw slots response: {data}")
-
-        # Cal.com v2 slots response shape:
-        # { "status": "success", "data": { "slots": { "2026-06-23": [{"time": "...", "slotUtcOffsetMinutes": ...}] } } }
-        # OR flat: { "status": "success", "data": [ {"time": "..."}, ... ] }
         raw_data = data.get("data", {})
 
         all_slots = []
 
         if isinstance(raw_data, dict):
-            # Nested by date: { "slots": { "YYYY-MM-DD": [...] } } or just { "YYYY-MM-DD": [...] }
+            # Nested by date: { "YYYY-MM-DD": [ {"start": "..."}, ... ], ... }
+            # May also have a "slots" wrapper key — handle both
             slots_by_date = raw_data.get("slots", raw_data)
             for day, day_slots in sorted(slots_by_date.items()):
-                if date and day != date:
-                    continue
                 if isinstance(day_slots, list):
                     for slot in day_slots:
-                        t = slot.get("time") or slot.get("start_time") or slot.get("startTime")
+                        # Cal.com v2 uses "start" field (confirmed from live response)
+                        t = slot.get("start") or slot.get("time") or slot.get("start_time") or slot.get("startTime")
                         if t:
                             all_slots.append({"start_time": t, "date": day})
         elif isinstance(raw_data, list):
-            # Flat list of slots
             for slot in raw_data:
-                t = slot.get("time") or slot.get("start_time") or slot.get("startTime")
+                t = slot.get("start") or slot.get("time") or slot.get("start_time") or slot.get("startTime")
                 if t:
-                    if date and not t.startswith(date):
-                        continue
                     all_slots.append({"start_time": t})
 
         if not all_slots:
-            logger.warning(f"[CALCOM] No slots found in response. Raw data: {raw_data}")
+            logger.warning(f"[CALCOM] No slots parsed from response. Raw data keys: {list(raw_data.keys()) if isinstance(raw_data, dict) else type(raw_data)}")
             return {
                 "available_slots": [],
                 "message": "I'm not seeing any open times in the next week. Let me have our rep reach out to you directly to find a time that works.",
@@ -119,6 +119,8 @@ class CalService:
 
         # Cap at 5 — nobody wants 20 times read aloud on a phone call
         all_slots = all_slots[:5]
+
+        logger.info(f"[CALCOM] Returning {len(all_slots)} slots")
 
         return {
             "available_slots": [
@@ -129,7 +131,7 @@ class CalService:
                 for s in all_slots
             ],
             "total_available": len(all_slots),
-            "note": "Times are in America/New_York. Speak them naturally, e.g. 'Monday at 2pm'.",
+            "note": "Times are in America/New_York. Speak them naturally, e.g. 'Monday at 9am'. If the contractor asked for a specific day, identify matching slots from this list.",
         }
 
     async def book_appointment(
