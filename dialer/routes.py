@@ -305,6 +305,9 @@ const STATUS_LABELS = {{
     'no-answer': 'No answer',
     'failed': 'Call failed',
     'canceled': 'Call canceled',
+    'transferring': 'Transferring to rep...',
+    'transferring_rep_dialing': 'Dialing rep now...',
+    'transfer_failed': 'Transfer failed - call may still be live',
 }};
 
 async function pollCallStatus() {{
