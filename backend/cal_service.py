@@ -54,8 +54,8 @@ class CalService:
 
         params = {
             "eventTypeId": CALCOM_EVENT_TYPE_ID,
-            "startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "endTime": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "timeZone": "America/New_York",
         }
 
