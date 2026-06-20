@@ -5,8 +5,8 @@ Each function the agent can call (defined in agent_config.py) maps to a
 method on a backend service. This module is the bridge between the voice
 agent layer and the backend layer.
 
-Two backends in play:
-  - calendly_service: real Calendly Scheduling API (live bookings)
+Backend in play:
+  - cal_service: real Cal.com API v2 (live bookings)
   - contractor_lookup: Supabase contractor record, for status updates
 
 `contractor` is the record resolved by backend/contractor_lookup.py when
@@ -31,16 +31,14 @@ async def dispatch_function(name: str, args: dict, contractor: dict = None) -> d
     Returns:
         Result dict that gets sent back to the agent as context for its next response.
     """
-    from backend.calendly_service import calendly_service
+    from backend.cal_service import cal_service
     from backend.contractor_lookup import get_effective_email, update_contractor_status
 
     if name == "check_availability":
-        return await calendly_service.get_available_slots(date=args.get("date"))
+        return await cal_service.get_available_slots(date=args.get("date"))
 
     elif name == "book_meeting":
         if not contractor:
-            # Shouldn't normally happen - Maya only offers to book once she
-            # knows who she's talking to - but fail safely if it does.
             return {
                 "success": False,
                 "error": "I don't have your contact info pulled up to book this. Let me have someone follow up by phone instead.",
@@ -51,11 +49,10 @@ async def dispatch_function(name: str, args: dict, contractor: dict = None) -> d
         # live on the call (signaled by the email_was_corrected flag).
         if args.get("email_was_corrected") and args.get("email"):
             email_to_use = args["email"]
-            # Persist the correction so future calls don't need to ask again.
             await update_contractor_status(
                 phone=contractor["phone"],
                 business_entity=contractor.get("business_entity", "CO-003"),
-                status=contractor.get("status", "not_called"),  # don't clobber status here
+                status=contractor.get("status", "not_called"),
                 corrected_email=email_to_use,
             )
         else:
@@ -67,13 +64,12 @@ async def dispatch_function(name: str, args: dict, contractor: dict = None) -> d
                 "error": "I don't have an email on file to send the invite to. Ask the contractor for one before booking.",
             }
 
-        result = await calendly_service.book_appointment(
+        result = await cal_service.book_appointment(
             contractor_name=contractor.get("owner_name") or args.get("contractor_name", "there"),
             contractor_email=email_to_use,
             start_time=args["start_time"],
         )
 
-        # Update contractor status on success so the dialer/CRM reflects it.
         if result.get("success"):
             await update_contractor_status(
                 phone=contractor["phone"],
@@ -88,8 +84,6 @@ async def dispatch_function(name: str, args: dict, contractor: dict = None) -> d
         reason = args.get("reason", "customer_goodbye")
         logger.info(f"Call ending: {reason}")
 
-        # Log the outcome to the contractor record, if we have one, so the
-        # dialer's status column reflects what actually happened.
         if contractor and reason in ("not_interested", "no_answer", "callback_requested"):
             status_map = {
                 "not_interested": "declined",
