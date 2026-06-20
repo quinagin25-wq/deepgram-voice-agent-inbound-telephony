@@ -20,7 +20,7 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.responses import PlainTextResponse
 
 from config import SERVER_HOST, SERVER_PORT, SERVER_EXTERNAL_URL, DEEPGRAM_API_KEY
-from telephony.routes import incoming_call, twilio_websocket
+from telephony.routes import incoming_call, twilio_websocket, transfer_fallback
 from dialer.routes import dialer_page, dial, call_status_callback, dialer_lock_status, end_call, dispose
 from backend.admin_import import import_contractors
 
@@ -49,6 +49,8 @@ app = Starlette(
     routes=[
         Route("/incoming-call/{token:path}", incoming_call, methods=["POST"]),
         Route("/incoming-call", incoming_call, methods=["POST"]),
+        Route("/transfer-fallback/{token:path}", transfer_fallback, methods=["POST"]),
+        Route("/transfer-fallback", transfer_fallback, methods=["POST"]),
         WebSocketRoute("/twilio/{token:path}", twilio_websocket),
         WebSocketRoute("/twilio", twilio_websocket),
         Route("/dialer", dialer_page, methods=["GET"]),
