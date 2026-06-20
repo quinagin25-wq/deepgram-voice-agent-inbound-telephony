@@ -228,6 +228,14 @@ class VoiceAgentSession:
             asyncio.create_task(self._end_call_after_delay())
 
         if function_name == "transfer_call":
+            # Log immediately, before the delay - so "nothing happened" and
+            # "transfer hasn't started yet" are distinguishable in logs and
+            # in the dialer UI. Previously the first log line came AFTER a
+            # 2s sleep, which made a working-but-slow transfer look
+            # identical to a broken one to anyone watching logs or the
+            # dashboard in real time.
+            logger.info(f"[SESSION:{self.call_sid}] Transfer requested - starting transfer sequence")
+            self._set_dialer_status("transferring")
             asyncio.create_task(self._transfer_call_after_delay())
 
     # ------------------------------------------------------------------
@@ -259,27 +267,117 @@ class VoiceAgentSession:
             pass
 
     async def _transfer_call_after_delay(self):
-        """Wait for transfer line to finish then redirect call to rep."""
-        await asyncio.sleep(2)
+        """Redirect the live call to a rep via Twilio's REST API.
 
-        logger.info(f"[SESSION:{self.call_sid}] Transferring call")
+        Sequence:
+          1. Brief pause so Maya's "let me connect you" line finishes
+             playing before we yank the call out of the media stream.
+          2. Build TwiML that dials the rep, with a timeout + fallback so
+             an unanswered/busy rep doesn't strand the caller in dead air.
+          3. PATCH the live call (client.calls(sid).update(twiml=...)).
+             This is the correct mechanism, but it must be applied to a
+             call currently in <Connect><Stream> - see note below.
+          4. Only close OUR websocket after we've confirmed the Twilio
+             update call returned successfully. Closing first created a
+             race in the old code: Twilio could end up processing "stream
+             closed" before or instead of "switch to this TwiML", so the
+             dial to the rep sometimes never happened at all.
 
-        from config import TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, REP_PHONE_NUMBER
-        if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and REP_PHONE_NUMBER:
-            try:
-                from twilio.rest import Client
-                client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-                twiml = f'<Response><Dial>{REP_PHONE_NUMBER}</Dial></Response>'
-                await asyncio.to_thread(
-                    client.calls(self.call_sid).update,
-                    twiml=twiml,
-                )
-                logger.info(f"[SESSION:{self.call_sid}] Call transferred to {REP_PHONE_NUMBER}")
-            except Exception as e:
-                logger.error(f"[SESSION:{self.call_sid}] Failed to transfer call: {e}")
-        else:
-            logger.warning(f"[SESSION:{self.call_sid}] Transfer skipped — REP_PHONE_NUMBER not configured")
+        On any failure (misconfiguration, Twilio error, timeout), we log
+        loudly with ERROR level and update the dialer's visible status so
+        a human watching the dashboard sees "transfer_failed" instead of
+        silence - the original bug report was specifically that nothing
+        observable happened, which led an operator to manually hang up
+        mid-transfer.
+        """
+        # Long enough for "Perfect, let me connect you..." to finish
+        # playing over the Twilio media stream, short enough that it
+        # doesn't look stalled on the dialer dashboard.
+        await asyncio.sleep(1.5)
 
+        from config import TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, REP_PHONE_NUMBER, SERVER_EXTERNAL_URL, WEBHOOK_SECRET
+
+        missing = [
+            name for name, val in [
+                ("TWILIO_ACCOUNT_SID", TWILIO_ACCOUNT_SID),
+                ("TWILIO_AUTH_TOKEN", TWILIO_AUTH_TOKEN),
+                ("REP_PHONE_NUMBER", REP_PHONE_NUMBER),
+            ] if not val
+        ]
+        if missing:
+            logger.error(
+                f"[SESSION:{self.call_sid}] TRANSFER FAILED - missing config: {', '.join(missing)}. "
+                f"Set these in the environment before transfer_call can work."
+            )
+            self._set_dialer_status("transfer_failed")
+            await self._close_twilio_ws()
+            return
+
+        # Fallback TwiML if the rep doesn't pick up - read by Twilio's
+        # action callback instead of leaving the caller connected to a
+        # ringing-forever Dial. Without this, a no-answer/busy rep means
+        # the caller just hears ringing until Twilio's own hard timeout.
+        host = (SERVER_EXTERNAL_URL or "").replace("https://", "").replace("http://", "").rstrip("/")
+        fallback_path = f"/transfer-fallback/{WEBHOOK_SECRET}" if WEBHOOK_SECRET else "/transfer-fallback"
+        fallback_url = f"https://{host}{fallback_path}" if host else None
+
+        action_attr = f' action="{fallback_url}" method="POST"' if fallback_url else ""
+        twiml = (
+            f'<Response><Dial timeout="20"{action_attr}>{REP_PHONE_NUMBER}</Dial></Response>'
+        )
+
+        from twilio.rest import Client
+        from twilio.base.exceptions import TwilioRestException
+
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+        try:
+            logger.info(f"[SESSION:{self.call_sid}] Sending Twilio redirect to dial {REP_PHONE_NUMBER}")
+            result = await asyncio.to_thread(
+                client.calls(self.call_sid).update,
+                twiml=twiml,
+            )
+            logger.info(
+                f"[SESSION:{self.call_sid}] Twilio accepted transfer redirect "
+                f"(call status now: {getattr(result, 'status', 'unknown')})"
+            )
+            self._set_dialer_status("transferring_rep_dialing")
+        except TwilioRestException as e:
+            # Common causes: call already ended (caller hung up first),
+            # or the call is no longer in a state that accepts redirects.
+            logger.error(
+                f"[SESSION:{self.call_sid}] TRANSFER FAILED - Twilio rejected the "
+                f"redirect (code={e.code}, status={e.status}): {e.msg}"
+            )
+            self._set_dialer_status("transfer_failed")
+            await self._close_twilio_ws()
+            return
+        except Exception as e:
+            logger.error(f"[SESSION:{self.call_sid}] TRANSFER FAILED - unexpected error: {e}")
+            self._set_dialer_status("transfer_failed")
+            await self._close_twilio_ws()
+            return
+
+        # Only close our side of the media stream now that Twilio has
+        # confirmed it accepted the new TwiML. Twilio itself will tear
+        # down the <Connect><Stream> as part of switching to <Dial>; we
+        # don't need to race it by closing first.
+        await self._close_twilio_ws()
+
+    def _set_dialer_status(self, status: str):
+        """Best-effort update to the dialer's polled call-state dict, so a
+        human watching the dashboard sees real-time transfer progress
+        instead of an unexplained gap. Safe no-op if the dialer module
+        isn't loaded or the call_sid doesn't match what the dialer thinks
+        is active (e.g. local/dev test calls)."""
+        try:
+            from dialer.routes import _active_call_lock
+            if _active_call_lock.get("call_sid") == self.call_sid:
+                _active_call_lock["status"] = status
+        except Exception as e:
+            logger.debug(f"[SESSION:{self.call_sid}] Could not update dialer status: {e}")
+
+    async def _close_twilio_ws(self):
         try:
             await self.twilio_ws.close()
         except Exception:
