@@ -39,10 +39,10 @@ TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 REP_PHONE_NUMBER = os.getenv("REP_PHONE_NUMBER")
 
 # ---------------------------------------------------------------------------
-# Calendly
+# Cal.com
 # ---------------------------------------------------------------------------
-CALENDLY_API_KEY = os.getenv("CALENDLY_API_KEY")
-CALENDLY_EVENT_TYPE_URI = os.getenv("CALENDLY_EVENT_TYPE_URI")  # resolved from booking link
+CALCOM_API_KEY = os.getenv("CALCOM_API_KEY")
+CALCOM_EVENT_TYPE_ID = os.getenv("CALCOM_EVENT_TYPE_ID")
 
 # ---------------------------------------------------------------------------
 # Supabase
