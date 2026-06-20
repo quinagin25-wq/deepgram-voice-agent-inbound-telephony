@@ -153,6 +153,15 @@ async def dialer_page(request: Request) -> HTMLResponse:
   .page-info {{ color: #ccc; }}
   .test-dial-box {{ background: #1a1a1a; border: 1px solid #1D9E75; border-radius: 8px; padding: 16px; margin-bottom: 16px; }}
   .test-dial-box input {{ background: #222; color: #fff; border: 1px solid #444; border-radius: 6px; padding: 8px 12px; margin: 0 10px; width: 200px; }}
+  .disp-btn {{ background: #222; color: #ccc; border: 1px solid #444; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 13px; }}
+  .disp-btn:hover {{ background: #333; color: #fff; }}
+  .disp-btn.selected {{ background: #1D9E75; color: #111; border-color: #1D9E75; }}
+  #disposition-panel {{ display: none; position: fixed; bottom: 0; left: 0; right: 0; background: #1a1a1a; border-top: 2px solid #1D9E75; padding: 20px 32px; z-index: 100; box-shadow: 0 -4px 24px rgba(0,0,0,0.5); }}
+  #disp-notes {{ flex: 1; background: #222; color: #fff; border: 1px solid #444; border-radius: 6px; padding: 8px 12px; resize: vertical; min-height: 60px; font-size: 13px; font-family: inherit; }}
+  #callback-at-input {{ background: #222; color: #fff; border: 1px solid #444; border-radius: 6px; padding: 6px 10px; margin-left: 8px; color-scheme: dark; }}
+  #disp-save-btn {{ background: #1D9E75; color: #111; border: none; padding: 10px 24px; border-radius: 6px; cursor: pointer; font-weight: 700; font-size: 14px; }}
+  #disp-save-btn:disabled {{ background: #555; color: #999; cursor: not-allowed; }}
+  #disp-skip-btn {{ background: transparent; color: #999; border: 1px solid #444; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }}
 </style>
 </head>
 <body>
@@ -177,6 +186,66 @@ async def dialer_page(request: Request) -> HTMLResponse:
   {pagination_html}
 
 <script>
+let _dispPhone = null;
+let _dispBusiness = null;
+let _dispStatus = null;
+
+function showDispositionPanel(phone, ownerName, businessName, businessEntity) {{
+    _dispPhone = phone;
+    _dispBusiness = businessEntity;
+    _dispStatus = null;
+    document.getElementById('disp-name').innerText = ownerName || businessName || '';
+    document.getElementById('disp-phone').innerText = phone;
+    document.getElementById('disp-notes').value = '';
+    document.getElementById('callback-at-input').value = '';
+    document.getElementById('callback-row').style.display = 'none';
+    document.getElementById('disp-save-btn').disabled = true;
+    document.querySelectorAll('.disp-btn').forEach(b => b.classList.remove('selected'));
+    document.getElementById('disposition-panel').style.display = 'block';
+}}
+
+function setDisposition(status) {{
+    _dispStatus = status;
+    document.querySelectorAll('.disp-btn').forEach(b => {{
+        b.classList.toggle('selected', b.dataset.status === status);
+    }});
+    document.getElementById('disp-save-btn').disabled = false;
+    document.getElementById('callback-row').style.display = status === 'callback_requested' ? 'block' : 'none';
+}}
+
+async function saveDisposition() {{
+    if (!_dispStatus) return;
+    const notes = document.getElementById('disp-notes').value.trim() || null;
+    const callbackAt = document.getElementById('callback-at-input').value || null;
+    const body = {{ phone: _dispPhone, business_entity: _dispBusiness, status: _dispStatus }};
+    if (notes) body.notes = notes;
+    if (callbackAt) body.callback_at = callbackAt;
+    try {{
+        const resp = await fetch('/dialer/dispose', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify(body)
+        }});
+        const data = await resp.json();
+        if (!resp.ok) {{
+            alert(data.error || 'Could not save disposition.');
+            return;
+        }}
+        const row = document.querySelector('tr[data-phone="' + _dispPhone + '"]');
+        if (row) row.querySelector('.status').innerText = _dispStatus.replace(/_/g, ' ');
+        dismissDisposition();
+    }} catch(e) {{
+        alert('Request failed: ' + e);
+    }}
+}}
+
+function dismissDisposition() {{
+    document.getElementById('disposition-panel').style.display = 'none';
+    _dispPhone = null;
+    _dispBusiness = null;
+    _dispStatus = null;
+}}
+
 const STATUS_LABELS = {{
     'initiating': 'Placing call...',
     'initiated': 'Call initiated...',
@@ -273,6 +342,9 @@ async function dial(phone, businessEntity, btn) {{
 
         const row = btn.closest('tr');
         row.querySelector('.status').innerText = humanMode ? 'dialed_manual' : 'dialed';
+        const ownerName = row.cells[0].innerText;
+        const businessName = row.cells[1].innerText;
+        showDispositionPanel(phone, ownerName, businessName, businessEntity);
 
         if (humanMode) {{
             window.location.href = 'tel:' + phone;
@@ -287,6 +359,34 @@ async function dial(phone, businessEntity, btn) {{
     }}
 }}
 </script>
+
+  <div id="disposition-panel">
+    <div style="max-width:960px; margin:0 auto;">
+      <div style="display:flex; align-items:center; gap:16px; margin-bottom:14px;">
+        <span style="color:#1D9E75; font-weight:700; font-size:15px;">Disposition</span>
+        <span id="disp-name" style="color:#fff; font-size:15px;"></span>
+        <span id="disp-phone" style="color:#999; font-size:13px;"></span>
+      </div>
+      <div style="display:flex; gap:10px; margin-bottom:14px; flex-wrap:wrap;">
+        <button class="disp-btn" onclick="setDisposition('callback_requested')" data-status="callback_requested">Interested</button>
+        <button class="disp-btn" onclick="setDisposition('booked')" data-status="booked">Booked</button>
+        <button class="disp-btn" onclick="setDisposition('declined')" data-status="declined">Not Interested</button>
+        <button class="disp-btn" onclick="setDisposition('wrong_number')" data-status="wrong_number">Wrong Number</button>
+        <button class="disp-btn" onclick="setDisposition('dnc')" data-status="dnc">DNC</button>
+      </div>
+      <div id="callback-row" style="display:none; margin-bottom:12px;">
+        <label style="color:#ccc; font-size:13px;">Callback date/time:</label>
+        <input type="datetime-local" id="callback-at-input" />
+      </div>
+      <div style="display:flex; gap:12px; align-items:flex-start;">
+        <textarea id="disp-notes" placeholder="Call notes (optional)..."></textarea>
+        <div style="display:flex; flex-direction:column; gap:8px;">
+          <button id="disp-save-btn" onclick="saveDisposition()" disabled>Save</button>
+          <button id="disp-skip-btn" onclick="dismissDisposition()">Skip</button>
+        </div>
+      </div>
+    </div>
+  </div>
 </body>
 </html>"""
     return HTMLResponse(html)
@@ -421,3 +521,34 @@ async def dialer_lock_status(request: Request) -> JSONResponse:
     """Lightweight endpoint the dialer page can poll to know if it's safe
     to enable the next Call button."""
     return JSONResponse(_active_call_lock)
+
+
+async def dispose(request: Request) -> JSONResponse:
+    """Save a call disposition (and optional notes/callback_at) for a contractor.
+    Called from the disposition panel after a call ends or is skipped.
+    """
+    body = await request.json()
+    phone = body.get("phone")
+    business_entity = body.get("business_entity", "CO-003")
+    status = body.get("status")
+    notes = body.get("notes") or None
+    callback_at = body.get("callback_at") or None
+
+    if not phone or not status:
+        return JSONResponse({"error": "phone and status are required"}, status_code=400)
+
+    valid_statuses = {"booked", "declined", "callback_requested", "wrong_number", "dnc"}
+    if status not in valid_statuses:
+        return JSONResponse({"error": f"invalid status: {status}"}, status_code=400)
+
+    success = await update_contractor_status(
+        phone=phone,
+        business_entity=business_entity,
+        status=status,
+        call_notes=notes,
+        callback_at=callback_at,
+    )
+    if not success:
+        return JSONResponse({"error": "Failed to save disposition."}, status_code=500)
+    logger.info(f"[DIALER] Disposition saved: {phone} → {status}")
+    return JSONResponse({"success": True})

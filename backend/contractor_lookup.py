@@ -125,6 +125,7 @@ async def update_contractor_status(
     status: str,
     call_notes: Optional[str] = None,
     corrected_email: Optional[str] = None,
+    callback_at: Optional[str] = None,
 ) -> bool:
     """Update a contractor's status after a call. Used by Maya's end-of-call
     handling and by the dialer when a call is initiated.
@@ -138,6 +139,8 @@ async def update_contractor_status(
         update_data["call_notes"] = call_notes
     if corrected_email:
         update_data["corrected_email"] = corrected_email
+    if callback_at:
+        update_data["callback_at"] = callback_at
 
     try:
         client = _get_client()

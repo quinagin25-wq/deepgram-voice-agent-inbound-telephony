@@ -21,7 +21,7 @@ from starlette.responses import PlainTextResponse
 
 from config import SERVER_HOST, SERVER_PORT, SERVER_EXTERNAL_URL, DEEPGRAM_API_KEY
 from telephony.routes import incoming_call, twilio_websocket
-from dialer.routes import dialer_page, dial, call_status_callback, dialer_lock_status, end_call
+from dialer.routes import dialer_page, dial, call_status_callback, dialer_lock_status, end_call, dispose
 from backend.admin_import import import_contractors
 
 # ---------------------------------------------------------------------------
@@ -57,6 +57,7 @@ app = Starlette(
         Route("/dialer/call-status", call_status_callback, methods=["POST"]),
         Route("/dialer/lock-status", dialer_lock_status, methods=["GET"]),
         Route("/dialer/end-call", end_call, methods=["POST"]),
+        Route("/dialer/dispose", dispose, methods=["POST"]),
         Route("/admin/import-contractors", import_contractors, methods=["GET"]),
         Route("/", dashboard),
     ],
