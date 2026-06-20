@@ -45,7 +45,7 @@ class CalService:
             logger.error("[CALCOM] CALCOM_EVENT_TYPE_ID is not set")
             return {
                 "available_slots": [],
-                "message": "I'm having trouble pulling up availability right now. Let me have someone follow up with you directly.",
+                "message": "I'm having trouble pulling up the calendar right now. Let me have our rep reach out to you directly to find a time.",
             }
 
         now = datetime.now(timezone.utc)
@@ -59,35 +59,62 @@ class CalService:
             "timeZone": "America/New_York",
         }
 
-        resp = requests.get(
-            f"{BASE_URL}/slots",
-            headers=self._headers(),
-            params=params,
-        )
+        try:
+            resp = requests.get(
+                f"{BASE_URL}/slots",
+                headers=self._headers(),
+                params=params,
+                timeout=10,
+            )
+        except Exception as e:
+            logger.error(f"[CALCOM] Availability request failed: {e}")
+            return {
+                "available_slots": [],
+                "message": "I'm having trouble pulling up the calendar right now. Let me have our rep reach out to you directly to find a time.",
+            }
 
         if resp.status_code != 200:
             logger.error(f"[CALCOM] Availability lookup failed: {resp.status_code} {resp.text}")
             return {
                 "available_slots": [],
-                "message": "I'm having trouble pulling up availability right now. Let me have someone follow up with you directly.",
+                "message": "I'm having trouble pulling up the calendar right now. Let me have our rep reach out to you directly to find a time.",
             }
 
         data = resp.json()
-        # v2 slots response: { "data": { "slots": { "2026-06-21": [ { "time": "..." }, ... ], ... } } }
-        slots_by_date = data.get("data", {}).get("slots", {})
+        logger.info(f"[CALCOM] Raw slots response: {data}")
 
-        # Flatten into a list sorted by time
+        # Cal.com v2 slots response shape:
+        # { "status": "success", "data": { "slots": { "2026-06-23": [{"time": "...", "slotUtcOffsetMinutes": ...}] } } }
+        # OR flat: { "status": "success", "data": [ {"time": "..."}, ... ] }
+        raw_data = data.get("data", {})
+
         all_slots = []
-        for day, day_slots in sorted(slots_by_date.items()):
-            if date and day != date:
-                continue
-            for slot in day_slots:
-                all_slots.append({"start_time": slot["time"], "date": day})
+
+        if isinstance(raw_data, dict):
+            # Nested by date: { "slots": { "YYYY-MM-DD": [...] } } or just { "YYYY-MM-DD": [...] }
+            slots_by_date = raw_data.get("slots", raw_data)
+            for day, day_slots in sorted(slots_by_date.items()):
+                if date and day != date:
+                    continue
+                if isinstance(day_slots, list):
+                    for slot in day_slots:
+                        t = slot.get("time") or slot.get("start_time") or slot.get("startTime")
+                        if t:
+                            all_slots.append({"start_time": t, "date": day})
+        elif isinstance(raw_data, list):
+            # Flat list of slots
+            for slot in raw_data:
+                t = slot.get("time") or slot.get("start_time") or slot.get("startTime")
+                if t:
+                    if date and not t.startswith(date):
+                        continue
+                    all_slots.append({"start_time": t})
 
         if not all_slots:
+            logger.warning(f"[CALCOM] No slots found in response. Raw data: {raw_data}")
             return {
                 "available_slots": [],
-                "message": "No open times found in the next week. Offer to follow up by text instead.",
+                "message": "I'm not seeing any open times in the next week. Let me have our rep reach out to you directly to find a time that works.",
             }
 
         # Cap at 5 — nobody wants 20 times read aloud on a phone call
@@ -102,7 +129,7 @@ class CalService:
                 for s in all_slots
             ],
             "total_available": len(all_slots),
-            "note": "Times are in America/New_York. Speak them naturally, e.g. 'Tuesday at 2pm'.",
+            "note": "Times are in America/New_York. Speak them naturally, e.g. 'Monday at 2pm'.",
         }
 
     async def book_appointment(
@@ -116,7 +143,7 @@ class CalService:
         """
         if not CALCOM_EVENT_TYPE_ID:
             logger.error("[CALCOM] CALCOM_EVENT_TYPE_ID is not set")
-            return {"success": False, "error": "Booking system is not configured. Have someone follow up by phone."}
+            return {"success": False, "error": "Booking system is not configured. Have our rep reach out directly."}
 
         name_parts = contractor_name.strip().split(" ", 1)
         first_name = name_parts[0]
@@ -138,11 +165,16 @@ class CalService:
             },
         }
 
-        resp = requests.post(
-            f"{BASE_URL}/bookings",
-            headers=self._headers(),
-            json=payload,
-        )
+        try:
+            resp = requests.post(
+                f"{BASE_URL}/bookings",
+                headers=self._headers(),
+                json=payload,
+                timeout=10,
+            )
+        except Exception as e:
+            logger.error(f"[CALCOM] Booking request failed: {e}")
+            return {"success": False, "error": "Booking system is not responding. Have our rep reach out directly."}
 
         if resp.status_code not in (200, 201):
             logger.error(f"[CALCOM] Booking failed: {resp.status_code} {resp.text}")
